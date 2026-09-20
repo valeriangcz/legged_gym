@@ -1,0 +1,281 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="hex_v4">
+<xacro:property name="M_PI" value="3.1415926535897931"/>
+<xacro:property name="joint_vec" value="5.5"/>
+<xacro:property name="damping" value="0.00"/> <!--电机力矩拟合有速度输入项，已经包括了damping部分的扭矩 0.0001341，这里设置为0-->
+<xacro:property name="friction" value="0.04"/> <!--电机力矩拟合有速度输入项，已经包括了damping部分的扭矩，0.04较为合理-->
+<!-- <xacro:property name="damping" value="0.0"/> -->
+<!-- <xacro:property name="friction" value="0.0"/> -->
+<xacro:macro name="leg" params="xyz rpy suffix rl">
+
+
+    <xacro:if value="${suffix in ['lb','rf']}">
+      <xacro:property name="thigh_up" value="${M_PI/2.0}"/>
+      <xacro:property name="thigh_low" value="${-M_PI*2.0/9.0}"/>
+    </xacro:if>
+    <xacro:if value="${suffix in ['lf','rb']}">
+      <xacro:property name="thigh_up" value="${M_PI*2.0/9.0}"/>
+      <xacro:property name="thigh_low" value="${-M_PI/2.0}"/>
+    </xacro:if>
+    <xacro:if value="${suffix in ['lm','rm']}">
+      <xacro:property name="thigh_up" value="${M_PI*2.0/9.0}"/>
+      <xacro:property name="thigh_low" value="${-M_PI*2.0/9.0}"/>
+    </xacro:if>
+
+
+  <link name="l_${suffix}_thigh">
+    <inertial>
+      <origin
+        xyz="0.0646897190866716 -0.00200755388553778 0.000561351384789549"
+        rpy="0 0 0" />
+      <mass
+        value="0.496689688064039" />
+      <inertia
+        ixx="0.000182622242033892"
+        ixy="-4.71275560332557E-08"
+        ixz="-1.17122592682552E-07"
+        iyy="0.000200032761867879"
+        iyz="6.67247112884031E-12"
+        izz="0.000167907382163042" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="../two_set_meshes/visual/l_${rl}_thigh.dae" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.89804 0.91765 0.92941 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+      <!-- <sphere radius="0.001" /> -->
+        <!-- <box size="0.03 0.03 0.03" /> -->
+        <mesh filename="../two_set_meshes/collision/l_${rl}_thigh.obj" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="j_${suffix}_thigh"
+    type="revolute">
+    <origin
+      xyz="${xyz}"
+      rpy="${rpy}" />
+    <parent link="body" />
+    <child
+      link="l_${suffix}_thigh" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="${thigh_low}"
+      upper="${thigh_up}"
+      effort="27"
+      velocity="${joint_vec}"/>
+    <dynamics damping="${damping}" friction="${friction}" />
+  </joint>
+
+  <link
+    name="l_${suffix}_knee">
+    <inertial>
+      <origin
+        xyz="0.06408996445712 0.000356376878972699 0.00274300170647657"
+        rpy="0 0 0" />
+      <mass
+        value="0.108154994189176" />
+      <inertia
+        ixx="2.13731581934939E-05"
+        ixy="-2.36269278022085E-06"
+        ixz="-5.78122930343107E-09"
+        iyy="0.000197765049686332"
+        iyz="-7.13210759870919E-09"
+        izz="0.000194350736455779" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="../two_set_meshes/visual/l_${rl}_knee.dae" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.89804 0.91765 0.92941 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="../two_set_meshes/collision/l_${rl}_knee.obj" />
+      </geometry>
+    </collision>
+  </link>
+
+  <joint
+    name="j_${suffix}_knee"
+    type="revolute">
+    <origin
+      xyz="0.072 0 0"
+      rpy="${M_PI/2} 0 0" />
+    <parent
+      link="l_${suffix}_thigh"/>
+    <child
+      link="l_${suffix}_knee"/>
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="${-M_PI*2/3.0}"
+      upper="${M_PI*25.0/36.0}"
+      effort="27"
+      velocity="${joint_vec}" />
+    <dynamics damping="${damping}" friction="${friction}" />
+  </joint>
+
+  <link
+    name="l_${suffix}_ankle">
+    <inertial>
+      <origin
+        xyz="0.0289603445829422 -1.56298764873233E-05 0.00207448639860258"
+        rpy="0 0 0" />
+      <mass
+        value="0.540605856314712" />
+      <inertia
+        ixx="0.000158577242931401"
+        ixy="4.43449475558145E-07"
+        ixz="-6.17354017520218E-07"
+        iyy="0.000511155345065857"
+        iyz="-7.27161298290885E-08"
+        izz="0.000535248742687074" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="../two_set_meshes/visual/l_${rl}_ankle.dae" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.89804 0.91765 0.92941 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="../two_set_meshes/collision/l_${rl}_ankle.obj" />
+      </geometry>
+    </collision>
+  </link>
+
+  <joint
+    name="j_${suffix}_ankle"
+    type="revolute">
+    <origin
+      xyz="0.13 0 0"
+      rpy="0 0 0" />
+    <parent
+      link="l_${suffix}_knee" />
+    <child
+      link="l_${suffix}_ankle" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="${-M_PI*31.0/36.0}"
+      upper="${M_PI*7.0/9.0}"
+      effort="27"
+      velocity="${joint_vec}" />
+      <dynamics damping="${damping}" friction="${friction}" />
+  </joint>
+  
+
+  <link name="l_${suffix}_toe">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <mass value="1e-2"/>
+      <inertia ixx="3.24e-07" ixy="0" ixz="0" iyy="3.24e-07" iyz="0" izz="3.24e-07" />
+      </inertial>
+      <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry> <sphere radius="0.009" /> </geometry>
+      </visual>
+      <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry> <sphere radius="0.009" /> </geometry>
+      </collision>
+  </link>
+
+  <joint name="j_${suffix}_toe" type="fixed">
+    <!-- <origin xyz="0.1855 0 0" rpy="0 0 0"/> -->
+    <origin xyz="0.2 0 0" rpy="0 0 0"/>
+    <parent link="l_${suffix}_ankle"/>
+    <child link="l_${suffix}_toe"/>
+  </joint>
+
+      
+
+
+</xacro:macro>
+
+<link
+    name="body">
+    <inertial>
+      <origin
+        xyz="0.0014417 0.043319 0.0041358"
+        rpy="0 0 0" />
+      <!-- <mass value="5.5207" /> -->
+      <mass value="6.5107" />
+      <inertia
+        ixx="0.03035"
+        ixy="-1.1005E-05"
+        ixz="1.3774E-07"
+        iyy="0.0081009"
+        iyz="9.3376E-06"
+        izz="0.036954" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../two_set_meshes/visual/body.dae" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <!-- <mesh filename="../two_set_meshes/collision/body.obj" /> -->
+        <box size="0.2 0.44 0.05" />
+      </geometry>
+    </collision>
+  </link>
+<xacro:leg xyz="0.1 0.22 0" rpy="0 0 0" suffix="rf" rl="r"/>
+<xacro:leg xyz="0.1 0 0" rpy="0 0 0" suffix="rm" rl="r"/>
+<xacro:leg xyz="0.1 -0.22 0" rpy="0 0 0" suffix="rb" rl="r"/>
+<xacro:leg xyz="-0.1 0.22 0" rpy="0 0 ${M_PI}" suffix="lf" rl="l"/>
+<xacro:leg xyz="-0.1 0 0" rpy="0 0 ${M_PI}" suffix="lm" rl="l"/>
+<xacro:leg xyz="-0.1 -0.22 0" rpy="0 0 ${M_PI}" suffix="lb" rl="l"/>
+</robot>

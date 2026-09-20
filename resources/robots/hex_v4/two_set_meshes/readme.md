@@ -1,0 +1,3 @@
+根目录下为solidworks直接导出urdf模型的stl文件（带有_collision是为碰撞检查准备的，带有visual是为可视化渲染准备的），需要转为根目录下的.obj文件，然后进行旋转，变为rot文件夹中的.obj文件
+
+

@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SE(3) 流形分段 Bezier 优化：数学推导与 Python 实现</title>
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['$', '$'], ['\\(', '\\)']],
+        displayMath: [['$$', '$$'], ['\\[', '\\]']],
+        processEscapes: true,
+        packages: {'[+]': ['ams', 'boldsymbol']}
+      },
+      svg: { fontCache: 'global' }
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+  <style>
+    :root {
+      --bg: #f7f8fb;
+      --card: #ffffff;
+      --text: #172033;
+      --muted: #5f6b7a;
+      --border: #dce3ee;
+      --accent: #2563eb;
+      --accent-soft: #eaf1ff;
+      --code-bg: #0f172a;
+      --code-text: #e5e7eb;
+      --warn: #fff7ed;
+      --warn-border: #fed7aa;
+      --ok: #ecfdf5;
+      --ok-border: #a7f3d0;
+    }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", "Microsoft YaHei", Arial, sans-serif;
+      line-height: 1.72;
+    }
+    header {
+      background: linear-gradient(135deg, #172033 0%, #1e3a8a 55%, #2563eb 100%);
+      color: #fff;
+      padding: 56px 24px 42px;
+    }
+    header .wrap, main {
+      max-width: 1080px;
+      margin: 0 auto;
+    }
+    header h1 {
+      margin: 0 0 14px;
+      font-size: 34px;
+      line-height: 1.25;
+      letter-spacing: -0.02em;
+    }
+    header p {
+      margin: 0;
+      max-width: 840px;
+      color: #dbeafe;
+      font-size: 17px;
+    }
+    main { padding: 28px 20px 70px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 26px 28px;
+      margin: 20px 0;
+      box-shadow: 0 10px 26px rgba(15, 23, 42, 0.06);
+    }
+    .toc {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .toc a {
+      display: block;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: var(--accent-soft);
+      color: #1d4ed8;
+      text-decoration: none;
+      font-weight: 600;
+    }
+    h2 {
+      margin-top: 0;
+      border-bottom: 2px solid var(--border);
+      padding-bottom: 8px;
+      font-size: 25px;
+    }
+    h3 { margin-top: 30px; font-size: 20px; }
+    h4 { margin-top: 24px; font-size: 17px; }
+    p { margin: 12px 0; }
+    ul, ol { padding-left: 24px; }
+    li { margin: 7px 0; }
+    .note, .warn, .good {
+      border-radius: 14px;
+      padding: 14px 16px;
+      margin: 16px 0;
+    }
+    .note { background: var(--accent-soft); border: 1px solid #bfdbfe; }
+    .warn { background: var(--warn); border: 1px solid var(--warn-border); }
+    .good { background: var(--ok); border: 1px solid var(--ok-border); }
+    .muted { color: var(--muted); }
+    code.inline {
+      background: #eef2ff;
+      color: #3730a3;
+      border-radius: 5px;
+      padding: 2px 5px;
+      font-size: 0.94em;
+    }
+    pre {
+      background: var(--code-bg);
+      color: var(--code-text);
+      border-radius: 14px;
+      padding: 18px 20px;
+      overflow-x: auto;
+      font-size: 14px;
+      line-height: 1.55;
+    }
+    pre code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 16px 0;
+      font-size: 15px;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: 10px 12px;
+      vertical-align: top;
+    }
+    th { background: #f1f5f9; text-align: left; }
+    .eqbox {
+      background: #f8fafc;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 8px 14px;
+      margin: 16px 0;
+      overflow-x: auto;
+    }
+    .small { font-size: 14px; }
+  </style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <h1>SE(3) 流形分段 Bezier 优化</h1>
+    <p>把 SE(3) De Casteljau 曲线、局部切空间参数化、SciPy L-BFGS-B 包装、外层 retraction 循环串成一个完整的数学与工程实现框架。</p>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>目录</h2>
+    <div class="toc">
+      <a href="#background">1. 背景与问题</a>
+      <a href="#micro-lie">2. Micro Lie Theory 的 Jacobian 是否需要</a>
+      <a href="#se3-basic">3. SE(3) 与 se(3) 基础</a>
+      <a href="#bezier">4. SE(3) De Casteljau Bezier</a>
+      <a href="#optimization">5. 从流形优化到 SciPy L-BFGS-B</a>
+      <a href="#retraction">6. 外层 Retraction 循环</a>
+      <a href="#finite-diff">7. 有限差分与梯度</a>
+      <a href="#implementation">8. Python 实现骨架</a>
+      <a href="#practical">9. 工程注意事项</a>
+    </div>
+  </section>
+
+  <section class="card" id="background">
+    <h2>1. 背景与问题</h2>
+    <p>你的规划问题可以抽象成：给定机器人机体位姿轨迹 $T(u) \in SE(3)$，通过黑盒或半黑盒的可行性检查函数计算代价：</p>
+    <div class="eqbox">
+      $$
+      C(T) = C_{\text{body-collision}}(T)
+      + C_{\text{leg-IK}}(T)
+      + C_{\text{workspace}}(T)
+      + C_{\text{leg-env-collision}}(T)
+      + C_{\text{foothold}}(T).
+      $$
+    </div>
+    <p>一条路径不是一个点，而是一段曲线。对采样点 $u_1,\dots,u_N$，总代价可以写成：</p>
+    <div class="eqbox">
+      $$
+      F(\mathcal{T})=
+      \sum_{\ell=1}^{N} C\left(T(u_\ell;\mathcal{T})\right)
+      + \lambda R(\mathcal{T}),
+      $$
+    </div>
+    <p>其中 $\mathcal{T}=\{T_0,T_1,T_2,T_3\}$ 是一段三次 Bezier 的控制位姿，$R(\mathcal{T})$ 是平滑性、长度或姿态变化正则项。</p>
+    <div class="note">
+      <strong>核心冲突：</strong> 优化器比如 SciPy L-BFGS-B 只能处理欧氏向量 $x\in\mathbb{R}^n$，但你的变量本质是 $T_i\in SE(3)$。解决方法不是修改 L-BFGS-B，而是给 SE(3) 控制点建立局部切空间参数化。
+    </div>
+  </section>
+
+  <section class="card" id="micro-lie">
+    <h2>2. Micro Lie Theory 里的流形 Jacobian 是否需要</h2>
+    <p>你看到的 <em>A micro Lie theory for state estimation in robotics</em> 主要面向状态估计、SLAM、视觉里程计等问题，里面系统整理了李群、李代数、boxplus/boxminus、右/左扰动、以及流形到流形函数的 Jacobian。</p>
+
+    <h3>2.1 它讲的 Jacobian 一般形式</h3>
+    <p>它关心的是一个流形映射：</p>
+    <div class="eqbox">
+      $$
+      f: \mathcal{M} \rightarrow \mathcal{N},
+      $$
+    </div>
+    <p>其中输入 $X\in\mathcal{M}$，输出 $Y=f(X)\in\mathcal{N}$。因为 $X$ 和 $Y$ 都可能不是普通向量，所以导数不能简单写成 $\partial f/\partial x$。通常要用扰动定义 Jacobian：</p>
+    <div class="eqbox">
+      $$
+      J
+      =
+      \left.
+      \frac{\partial}{\partial \delta x}
+      \left(
+      f(X\oplus \delta x) \ominus f(X)
+      \right)
+      \right|_{\delta x=0}.
+      $$
+    </div>
+    <p>这里：</p>
+    <ul>
+      <li>$\oplus$ 表示在流形上施加小扰动；</li>
+      <li>$\ominus$ 表示把两个流形点的差转回切空间；</li>
+      <li>$J$ 把输入切空间的扰动映射到输出切空间的扰动。</li>
+    </ul>
+
+    <h3>2.2 我们这里是否必须用这套完整 Jacobian？</h3>
+    <p>如果你的目标函数最终是标量：</p>
+    <div class="eqbox">
+      $$
+      F: SE(3)^m \rightarrow \mathbb{R},
+      $$
+    </div>
+    <p>那么不一定需要手推完整的“流形到流形 Jacobian”。我们可以构造局部欧氏目标：</p>
+    <div class="eqbox">
+      $$
+      \Phi_k(\Delta)=F\left(\mathcal{R}_{X^{(k)}}(\Delta)\right),
+      \qquad
+      \Delta\in\mathbb{R}^{6m},
+      $$
+    </div>
+    <p>然后让 SciPy 在 $\Delta$ 上做普通有限差分或 L-BFGS-B。</p>
+
+    <div class="good">
+      <strong>结论：</strong> 对你现在这个 SE(3) Bezier 路径优化来说，Micro Lie Theory 里的 Jacobian 概念是理论背景，非常有帮助；但工程上不必一开始手推 $\partial T(u)/\partial T_i$。你可以先把控制位姿参数化为 $T_i\exp(\widehat{\delta\xi_i})$，然后让 SciPy 对 $\delta\xi_i$ 做数值差分。
+    </div>
+
+    <p>什么时候需要它？如果后面你想做更高效的 Gauss-Newton、LM、手写解析梯度，或者 cost 本身是流形残差，比如：</p>
+    <div class="eqbox">
+      $$
+      r(T)=\log\left(T_{\text{target}}^{-1}T\right)\in\mathbb{R}^6,
+      $$
+    </div>
+    <p>那就需要更认真处理右 Jacobian、左 Jacobian、伴随矩阵 $\operatorname{Ad}_T$ 等概念。</p>
+  </section>
+
+  <section class="card" id="se3-basic">
+    <h2>3. SE(3) 与 se(3) 基础</h2>
+    <h3>3.1 位姿矩阵</h3>
+    <p>刚体位姿写成：</p>
+    <div class="eqbox">
+      $$
+      T =
+      \begin{bmatrix}
+      R & p \\
+      0 & 1
+      \end{bmatrix}
+      \in SE(3),
+      \qquad
+      R\in SO(3),\quad p\in\mathbb{R}^3.
+      $$
+    </div>
+    <p>世界点 $x_W$ 到机器人机体系的变换是：</p>
+    <div class="eqbox">
+      $$
+      x_R = R^\top(x_W-p).
+      $$
+    </div>
+    <p>因此碰撞、足端 IK、工作空间、地形法向等都依赖完整的 $R$ 和 $p$，不是单独依赖平移或旋转。</p>
+
+    <h3>3.2 李代数扰动</h3>
+    <p>SE(3) 的小扰动写成 6 维向量：</p>
+    <div class="eqbox">
+      $$
+      \xi =
+      \begin{bmatrix}
+      \rho \\
+      \phi
+      \end{bmatrix}
+      \in\mathbb{R}^6,
+      \qquad
+      \rho\in\mathbb{R}^3,
+      \quad
+      \phi\in\mathbb{R}^3.
+      $$
+    </div>
+    <p>其中 $\rho$ 是平移相关扰动，$\phi$ 是旋转扰动。对应的矩阵形式是：</p>
+    <div class="eqbox">
+      $$
+      \widehat{\xi}=
+      \begin{bmatrix}
+      \widehat{\phi} & \rho \\
+      0 & 0
+      \end{bmatrix},
+      $$
+      $$
+      \widehat{\phi}=
+      \begin{bmatrix}
+      0 & -\phi_z & \phi_y \\
+      \phi_z & 0 & -\phi_x \\
+      -\phi_y & \phi_x & 0
+      \end{bmatrix}.
+      $$
+    </div>
+    <p>通过指数映射：</p>
+    <div class="eqbox">
+      $$
+      \exp(\widehat{\xi})\in SE(3)
+      $$
+    </div>
+    <p>可以把切空间小扰动变成合法位姿增量。</p>
+
+    <h3>3.3 右扰动与左扰动</h3>
+    <table>
+      <thead>
+        <tr><th>形式</th><th>公式</th><th>直观含义</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>右扰动</td>
+          <td>$T' = T\exp(\widehat{\delta\xi})$</td>
+          <td>扰动表达在当前 body/local frame，更适合“机器人自身坐标系下的小步移动”。</td>
+        </tr>
+        <tr>
+          <td>左扰动</td>
+          <td>$T' = \exp(\widehat{\delta\xi})T$</td>
+          <td>扰动表达在 world frame，更像世界坐标系下的小步移动。</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>本文后续默认使用右扰动：</p>
+    <div class="eqbox">
+      $$
+      T\oplus\delta\xi = T\exp(\widehat{\delta\xi}).
+      $$
+    </div>
+  </section>
+
+  <section class="card" id="bezier">
+    <h2>4. SE(3) De Casteljau Bezier</h2>
+    <h3>4.1 为什么不用普通加权求和</h3>
+    <p>普通欧氏三次 Bezier 可以写成：</p>
+    <div class="eqbox">
+      $$
+      B(u)=(1-u)^3P_0+3(1-u)^2uP_1+3(1-u)u^2P_2+u^3P_3.
+      $$
+    </div>
+    <p>但这个公式需要对点做加法和数乘。SE(3) 位姿矩阵不能直接加权求和：</p>
+    <div class="eqbox">
+      $$
+      0.5T_0+0.5T_1\notin SE(3)
+      $$
+    </div>
+    <p>因为旋转部分通常会破坏 $R^\top R=I$。</p>
+
+    <h3>4.2 两个 SE(3) 位姿的测地插值</h3>
+    <p>定义两个位姿之间的插值：</p>
+    <div class="eqbox">
+      $$
+      \operatorname{geo}(T_a,T_b,u)
+      =
+      T_a\exp\left(u\log(T_a^{-1}T_b)\right),
+      \qquad u\in[0,1].
+      $$
+    </div>
+    <p>它表示从 $T_a$ 出发，沿着相对位姿 $T_a^{-1}T_b$ 对应的恒定 twist 走 $u$ 比例。</p>
+
+    <h3>4.3 三次 SE(3) Bezier 递推</h3>
+    <p>给定控制位姿：</p>
+    <div class="eqbox">
+      $$
+      T_0,T_1,T_2,T_3\in SE(3),
+      $$
+    </div>
+    <p>第一层：</p>
+    <div class="eqbox">
+      $$
+      T_{01}=\operatorname{geo}(T_0,T_1,u),\quad
+      T_{12}=\operatorname{geo}(T_1,T_2,u),\quad
+      T_{23}=\operatorname{geo}(T_2,T_3,u).
+      $$
+    </div>
+    <p>第二层：</p>
+    <div class="eqbox">
+      $$
+      T_{012}=\operatorname{geo}(T_{01},T_{12},u),\quad
+      T_{123}=\operatorname{geo}(T_{12},T_{23},u).
+      $$
+    </div>
+    <p>第三层：</p>
+    <div class="eqbox">
+      $$
+      T(u)=\operatorname{geo}(T_{012},T_{123},u).
+      $$
+    </div>
+    <p>这就是把普通 De Casteljau 里的线性插值替换成 SE(3) 插值。</p>
+  </section>
+
+  <section class="card" id="optimization">
+    <h2>5. 从流形优化到 SciPy L-BFGS-B</h2>
+    <h3>5.1 原始流形优化问题</h3>
+    <p>假设只优化中间两个控制点：</p>
+    <div class="eqbox">
+      $$
+      \min_{T_1,T_2\in SE(3)} F(T_1,T_2).
+      $$
+    </div>
+    <p>SciPy 不认识 $T_i\in SE(3)$，只认识向量 $x\in\mathbb{R}^n$。</p>
+
+    <h3>5.2 固定初始控制点的一次性局部参数化</h3>
+    <p>给定初始控制点：</p>
+    <div class="eqbox">
+      $$
+      \bar T_1,\bar T_2,
+      $$
+    </div>
+    <p>令优化变量为：</p>
+    <div class="eqbox">
+      $$
+      x=\begin{bmatrix}\xi_1\\\xi_2\end{bmatrix}\in\mathbb{R}^{12}.
+      $$
+    </div>
+    <p>通过指数映射生成真正的控制点：</p>
+    <div class="eqbox">
+      $$
+      T_1(x)=\bar T_1\exp(\widehat{\xi_1}),
+      \qquad
+      T_2(x)=\bar T_2\exp(\widehat{\xi_2}).
+      $$
+    </div>
+    <p>于是 SciPy 看到的目标函数是：</p>
+    <div class="eqbox">
+      $$
+      \Phi_{\bar T}(x)=F\left(\bar T_1\exp(\widehat{\xi_1}),\bar T_2\exp(\widehat{\xi_2})\right).
+      $$
+    </div>
+    <p>这就把流形优化转成了普通欧氏优化。</p>
+
+    <div class="warn">
+      如果最优解离初值比较远，那么一次性使用 $\bar T_i\exp(\widehat{\xi_i})$ 可能让 $\xi_i$ 变得很大。此时局部坐标会变差，旋转还可能遇到接近 $\pi$ 的参数化问题。因此更稳的方式是外层 retraction。
+    </div>
+  </section>
+
+  <section class="card" id="retraction">
+    <h2>6. 外层 Retraction 循环</h2>
+    <h3>6.1 第 k 轮局部问题</h3>
+    <p>第 $k$ 轮已有当前控制点：</p>
+    <div class="eqbox">
+      $$
+      T_1^{(k)},T_2^{(k)}.
+      $$
+    </div>
+    <p>只优化它们附近的小扰动：</p>
+    <div class="eqbox">
+      $$
+      \delta\xi_1^{(k)},\delta\xi_2^{(k)}\in\mathbb{R}^6.
+      $$
+    </div>
+    <p>局部目标函数：</p>
+    <div class="eqbox">
+      $$
+      \Phi_k(\delta\xi_1,\delta\xi_2)
+      =
+      F\left(
+      T_1^{(k)}\exp(\widehat{\delta\xi_1}),
+      T_2^{(k)}\exp(\widehat{\delta\xi_2})
+      \right).
+      $$
+    </div>
+    <p>内层求解：</p>
+    <div class="eqbox">
+      $$
+      (\delta\xi_1^\star,\delta\xi_2^\star)
+      =
+      \arg\min_{\delta\xi_1,\delta\xi_2\in\mathcal{B}}
+      \Phi_k(\delta\xi_1,\delta\xi_2).
+      $$
+    </div>
+    <p>其中 $\mathcal{B}$ 是局部 box bounds，例如：</p>
+    <div class="eqbox">
+      $$
+      |\delta\rho_{i,j}|\le r_t,
+      \qquad
+      |\delta\phi_{i,j}|\le r_r.
+      $$
+    </div>
+
+    <h3>6.2 应用 retraction 更新控制点</h3>
+    <p>优化结束后更新：</p>
+    <div class="eqbox">
+      $$
+      T_i^{(k+1)}=T_i^{(k)}\exp(\widehat{\delta\xi_i^\star}),
+      \qquad i\in\{1,2\}.
+      $$
+    </div>
+    <p>下一轮重新令优化变量初值为：</p>
+    <div class="eqbox">
+      $$
+      \delta\xi_1=0,
+      \qquad
+      \delta\xi_2=0.
+      $$
+    </div>
+
+    <h3>6.3 为什么差距远时它更有用</h3>
+    <p>如果一次性优化，最终可能需要很大的：</p>
+    <div class="eqbox">
+      $$
+      \left\|\log\left((T_i^{(0)})^{-1}T_i^\star\right)\right\|.
+      $$
+    </div>
+    <p>这意味着最优控制点离初始控制点较远。此时从初始点建立的局部坐标不再局部。外层 retraction 相当于把大位姿变化拆成多次小变化：</p>
+    <div class="eqbox">
+      $$
+      T_i^{(0)}\rightarrow T_i^{(1)}\rightarrow T_i^{(2)}\rightarrow\cdots\rightarrow T_i^\star,
+      $$
+      $$
+      T_i^{(k+1)}=T_i^{(k)}\exp(\widehat{\delta\xi_i^{(k)}}),
+      \qquad
+      \|\delta\xi_i^{(k)}\| \text{ small}.
+      $$
+    </div>
+    <div class="good">
+      <strong>判断：</strong> 是的，初值和最终优化结果差距越远，外层 retraction 的作用越明显。它让 L-BFGS-B 每一轮都工作在当前位姿附近的小切空间里，而不是一直使用初始点的远距离局部坐标。
+    </div>
+  </section>
+
+  <section class="card" id="finite-diff">
+    <h2>7. 有限差分与梯度</h2>
+    <h3>7.1 普通欧氏有限差分</h3>
+    <p>在 $\mathbb{R}^n$ 中：</p>
+    <div class="eqbox">
+      $$
+      \frac{\partial f}{\partial x_i}
+      \approx
+      \frac{f(x+\epsilon e_i)-f(x-\epsilon e_i)}{2\epsilon}.
+      $$
+    </div>
+
+    <h3>7.2 SE(3) 上的有限差分</h3>
+    <p>在 SE(3) 中不要写 $T+\epsilon E_i$，而应写：</p>
+    <div class="eqbox">
+      $$
+      T^+=T\exp(\epsilon\widehat{e_i}),
+      \qquad
+      T^-=T\exp(-\epsilon\widehat{e_i}).
+      $$
+    </div>
+    <p>于是标量代价的右扰动梯度为：</p>
+    <div class="eqbox">
+      $$
+      g_i
+      \approx
+      \frac{F(T\exp(\epsilon\widehat{e_i}))-F(T\exp(-\epsilon\widehat{e_i}))}{2\epsilon}.
+      $$
+    </div>
+
+    <h3>7.3 为什么用 SciPy 时不需要手写 SE(3) 差分</h3>
+    <p>因为你定义的是：</p>
+    <div class="eqbox">
+      $$
+      \Phi_k(x)=F\left(T^{(k)}\exp(\widehat{x})\right).
+      $$
+    </div>
+    <p>SciPy 对 $x$ 做普通差分：</p>
+    <div class="eqbox">
+      $$
+      \Phi_k(\epsilon e_i)-\Phi_k(-\epsilon e_i),
+      $$
+    </div>
+    <p>实际就等价于：</p>
+    <div class="eqbox">
+      $$
+      F\left(T^{(k)}\exp(\epsilon\widehat{e_i})\right)
+      -
+      F\left(T^{(k)}\exp(-\epsilon\widehat{e_i})\right).
+      $$
+    </div>
+    <p>所以只要你的 <code class="inline">objective(x)</code> 里正确使用 $T\exp(\widehat{x})$，SciPy 的有限差分就是合法的 SE(3) 局部扰动。</p>
+  </section>
+
+  <section class="card" id="implementation">
+    <h2>8. Python 实现骨架</h2>
+    <p>下面代码是结构示例，重点是接口组织。具体 <code class="inline">SE3.exp</code>、<code class="inline">SE3.log</code>、<code class="inline">robot_feasi_cost</code> 需要对接你项目里的实现。</p>
+
+    <h3>8.1 se(3) 基础函数示例</h3>
+    <pre><code>import numpy as np
+from scipy.linalg import expm, logm
+
+
+def hat_so3(phi):
+    """phi: shape (3,) -> skew matrix."""
+    x, y, z = phi
+    return np.array([
+        [0.0, -z,  y],
+        [z,   0.0, -x],
+        [-y,  x,   0.0],
+    ])
+
+
+def hat_se3(xi):
+    """xi = [rho_x, rho_y, rho_z, phi_x, phi_y, phi_z]."""
+    rho = xi[:3]
+    phi = xi[3:]
+    X = np.zeros((4, 4))
+    X[:3, :3] = hat_so3(phi)
+    X[:3, 3] = rho
+    return X
+
+
+def se3_exp(xi):
+    """Simple version using scipy.linalg.expm.
+    For high-performance code, replace with closed-form SE(3) exp.
+    """
+    return expm(hat_se3(xi))
+
+
+def se3_log(T):
+    """Simple version using scipy.linalg.logm.
+    For high-performance code, replace with closed-form SE(3) log.
+    """
+    Xi = logm(T).real
+    rho = Xi[:3, 3]
+    phi_hat = Xi[:3, :3]
+    phi = np.array([phi_hat[2, 1], phi_hat[0, 2], phi_hat[1, 0]])
+    return np.concatenate([rho, phi])
+</code></pre>
+
+    <h3>8.2 SE(3) 插值与 Bezier</h3>
+    <pre><code>def se3_geo(Ta, Tb, u):
+    """SE(3) interpolation: Ta * exp(u * log(Ta^{-1} Tb))."""
+    Tab = np.linalg.inv(Ta) @ Tb
+    xi = se3_log(Tab)
+    return Ta @ se3_exp(u * xi)
+
+
+def se3_bezier_cubic(control_poses, u):
+    """Cubic SE(3) De Casteljau Bezier.
+    control_poses: [T0, T1, T2, T3]
+    """
+    T0, T1, T2, T3 = control_poses
+
+    T01 = se3_geo(T0, T1, u)
+    T12 = se3_geo(T1, T2, u)
+    T23 = se3_geo(T2, T3, u)
+
+    T012 = se3_geo(T01, T12, u)
+    T123 = se3_geo(T12, T23, u)
+
+    Tu = se3_geo(T012, T123, u)
+    return Tu
+</code></pre>
+
+    <h3>8.3 把 SciPy 的 x 映射成控制位姿</h3>
+    <pre><code>def apply_delta_to_control_poses(base_poses, x, free_indices=(1, 2)):
+    """Apply right perturbation to selected control poses.
+
+    base_poses: list of 4x4 SE(3) matrices
+    x: shape (6 * len(free_indices),)
+    free_indices: which control poses are optimized
+    """
+    trial_poses = [T.copy() for T in base_poses]
+
+    for local_id, pose_id in enumerate(free_indices):
+        xi = x[6 * local_id : 6 * (local_id + 1)]
+        trial_poses[pose_id] = base_poses[pose_id] @ se3_exp(xi)
+
+    return trial_poses
+</code></pre>
+
+    <h3>8.4 路径代价函数</h3>
+    <pre><code>def path_cost(control_poses, us):
+    total = 0.0
+
+    for u in us:
+        Tu = se3_bezier_cubic(control_poses, u)
+        total += robot_feasi_cost(Tu)  # connect to RobotFeasiCheck soft cost
+
+    total += smoothness_regularization(control_poses)
+    return total
+</code></pre>
+
+    <h3>8.5 单轮 L-BFGS-B</h3>
+    <pre><code>from scipy.optimize import minimize
+
+
+def optimize_one_local_round(base_poses, us, free_indices=(1, 2)):
+    dim = 6 * len(free_indices)
+    x0 = np.zeros(dim)
+
+    # Example local bounds: translation in meters, rotation in radians.
+    local_bounds = []
+    for _ in free_indices:
+        local_bounds += [
+            (-0.25, 0.25),  # dx
+            (-0.25, 0.25),  # dy
+            (-0.15, 0.15),  # dz
+            (-0.25, 0.25),  # droll
+            (-0.25, 0.25),  # dpitch
+            (-0.40, 0.40),  # dyaw
+        ]
+
+    def objective_local(x):
+        trial_poses = apply_delta_to_control_poses(
+            base_poses, x, free_indices=free_indices
+        )
+        return path_cost(trial_poses, us)
+
+    res = minimize(
+        objective_local,
+        x0,
+        method="L-BFGS-B",
+        bounds=local_bounds,
+        jac="3-point",
+        options={
+            "finite_diff_rel_step": 1e-4,
+            "maxiter": 40,
+            "ftol": 1e-6,
+            "gtol": 1e-5,
+        },
+    )
+
+    new_poses = apply_delta_to_control_poses(
+        base_poses, res.x, free_indices=free_indices
+    )
+    return new_poses, res
+</code></pre>
+
+    <h3>8.6 外层 retraction 优化</h3>
+    <pre><code>def optimize_se3_bezier_with_retraction(init_poses, us, free_indices=(1, 2)):
+    control_poses = [T.copy() for T in init_poses]
+
+    history = []
+    max_outer_iter = 8
+    step_stop = 1e-4
+    cost_stop = 1e-5
+
+    prev_cost = path_cost(control_poses, us)
+
+    for k in range(max_outer_iter):
+        base_poses = [T.copy() for T in control_poses]
+
+        new_poses, res = optimize_one_local_round(
+            base_poses, us, free_indices=free_indices
+        )
+
+        new_cost = path_cost(new_poses, us)
+        step_norm = np.linalg.norm(res.x)
+        improvement = prev_cost - new_cost
+
+        history.append({
+            "outer_iter": k,
+            "success": res.success,
+            "cost": new_cost,
+            "step_norm": step_norm,
+            "improvement": improvement,
+            "message": res.message,
+        })
+
+        control_poses = new_poses
+
+        if step_norm < step_stop:
+            break
+        if abs(improvement) < cost_stop:
+            break
+
+        prev_cost = new_cost
+
+    return control_poses, history
+</code></pre>
+  </section>
+
+  <section class="card" id="practical">
+    <h2>9. 工程注意事项</h2>
+    <h3>9.1 soft cost 比 hard feasibility 更适合 L-BFGS-B</h3>
+    <p>如果代价是：</p>
+    <div class="eqbox">
+      $$
+      C(T)=
+      \begin{cases}
+      0, & \text{feasible},\\
+      10^6, & \text{infeasible},
+      \end{cases}
+      $$
+    </div>
+    <p>那么大多数位置的有限差分梯度会很差。建议优化阶段使用连续 penalty，例如：</p>
+    <div class="eqbox">
+      $$
+      C_{\text{collision}}(T)=\max(0,d_{\text{safe}}-d(T))^2,
+      $$
+      $$
+      C_{\text{workspace}}(T)=\max(0,\operatorname{violation}(T))^2.
+      $$
+    </div>
+    <p>最后再用 hard feasibility check 验收。</p>
+
+    <h3>9.2 平移和旋转尺度要分开</h3>
+    <p>平移单位是米，旋转单位是弧度。直接把它们放在同一个 L-BFGS-B 变量里可行，但 bounds 和 penalty 权重要小心设置。例如：</p>
+    <div class="eqbox">
+      $$
+      |\delta \rho| \le 0.2\text{ m},
+      \qquad
+      |\delta \phi| \le 0.2\text{ rad}.
+      $$
+    </div>
+
+    <h3>9.3 什么时候需要更高级的 Jacobian</h3>
+    <p>一开始建议：</p>
+    <ul>
+      <li>使用 $T_i\exp(\widehat{\delta\xi_i})$ 包装 SE(3) 控制点；</li>
+      <li>让 SciPy 用 <code class="inline">jac="3-point"</code> 做数值差分；</li>
+      <li>外层用 retraction 保持局部扰动小。</li>
+    </ul>
+    <p>后续如果要提升速度或精度，再考虑手写：</p>
+    <ul>
+      <li>$\partial C/\partial T$；</li>
+      <li>$\partial T(u)/\partial T_i$；</li>
+      <li>SE(3) 左/右 Jacobian；</li>
+      <li>伴随矩阵 $\operatorname{Ad}_T$；</li>
+      <li>Gauss-Newton 或 Levenberg-Marquardt。</li>
+    </ul>
+
+    <h3>9.4 一句话总结</h3>
+    <div class="note">
+      <p>SE(3) 优化不是把矩阵摊平成 16 维去优化，而是把每个控制位姿附近的合法小运动写成 $\delta\xi\in\mathbb{R}^6$，通过 $T\exp(\widehat{\delta\xi})$ 映射回流形。SciPy 仍然优化普通向量；你负责把普通向量解释成 SE(3) 上的局部扰动。</p>
+    </div>
+  </section>
+
+  <section class="card small">
+    <h2>参考说明</h2>
+    <p>本文件中的实现骨架使用 <code class="inline">scipy.linalg.expm/logm</code> 是为了表达清晰；真实工程中建议替换为闭式 SE(3) Exp/Log 或项目已有实现，以提升速度与数值稳定性。</p>
+    <p>公式渲染依赖 MathJax CDN；在离线环境下需要本地部署 MathJax 才能正常显示。</p>
+  </section>
+</main>
+</body>
+</html>

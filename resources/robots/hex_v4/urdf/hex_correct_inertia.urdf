@@ -1,0 +1,645 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- This URDF was automatically created by SolidWorks to URDF Exporter! Originally created by Stephen Brawner (brawner@gmail.com) 
+     Commit Version: 1.6.0-4-g7f85cfe  Build Version: 1.6.7995.38578
+     For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
+<robot
+  name="hex_visual">
+  <link
+    name="body">
+    <inertial>
+      <origin
+        xyz="0.000822535008012846 0.0186195362769978 -0.00265534312370179"
+        rpy="0 0 0" />
+      <mass
+        value="5.28293575709216" />
+      <inertia
+        ixx="0.0305259912290224"
+        ixy="-1.13661394476001E-05"
+        ixz="4.25166886192714E-08"
+        iyy="0.00857740086114433"
+        iyz="8.99056216741413E-06"
+        izz="0.0379015568538304" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/body.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/body.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="j_rf_ankle"
+    type="revolute">
+    <origin
+      xyz="0.13 0 0"
+      rpy="0 0 0" />
+    <parent
+      link="l_rf_knee" />
+    <child
+      link="l_rf_ankle" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="0"
+      upper="0"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="l_lf_thigh">
+    <inertial>
+      <origin
+        xyz="0.061295 -0.0012564 0.00081764"
+        rpy="0 0 0" />
+      <mass
+        value="0.33917" />
+      <inertia
+        ixx="0.00013181"
+        ixy="-4.7272E-08"
+        ixz="-1.447E-07"
+        iyy="0.00014472"
+        iyz="2.2081E-09"
+        izz="0.0001171" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_lf_thigh.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.89804 0.91765 0.92941 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_lf_thigh.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="j_lf_thigh"
+    type="revolute">
+    <origin
+      xyz="-0.0999999999999999 0.22 0"
+      rpy="0 0 -3.14159265358979" />
+    <parent
+      link="body" />
+    <child
+      link="l_lf_thigh" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="0"
+      upper="0"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="l_lf_knee">
+    <inertial>
+      <origin
+        xyz="0.06408996445712 0.000356376878972699 0.00274300170647657"
+        rpy="0 0 0" />
+      <mass
+        value="0.108154994189176" />
+      <inertia
+        ixx="2.13731581934939E-05"
+        ixy="-2.36269278022085E-06"
+        ixz="-5.78122930343107E-09"
+        iyy="0.000197765049686332"
+        iyz="-7.13210759870919E-09"
+        izz="0.000194350736455779" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_lf_knee.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.898039215686275 0.917647058823529 0.929411764705882 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_lf_knee.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="j_lf_knee"
+    type="revolute">
+    <origin
+      xyz="0.0719999999999999 0 0"
+      rpy="1.5707963267949 0 0" />
+    <parent
+      link="l_lf_thigh" />
+    <child
+      link="l_lf_knee" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="0"
+      upper="0"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="l_lf_ankle">
+    <inertial>
+      <origin
+        xyz="0.036644 0.00017899 0.0013568"
+        rpy="0 0 0" />
+      <mass
+        value="0.38533" />
+      <inertia
+        ixx="0.00010685"
+        ixy="4.4361E-07"
+        ixz="-4.771E-07"
+        iyy="0.00046094"
+        iyz="-7.2699E-08"
+        izz="0.00048066" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_lf_ankle.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.89804 0.91765 0.92941 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_lf_ankle.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="j_lf_ankle"
+    type="revolute">
+    <origin
+      xyz="0.13 0 0"
+      rpy="0 0 0" />
+    <parent
+      link="l_lf_knee" />
+    <child
+      link="l_lf_ankle" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="0"
+      upper="0"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="l_lf_foot">
+    <inertial>
+      <origin
+        xyz="0.00067338 -1.0249E-09 -3.525E-15"
+        rpy="0 0 0" />
+      <mass
+        value="0.029924" />
+      <inertia
+        ixx="4.4465E-06"
+        ixy="2.2692E-15"
+        ixz="1.5724E-14"
+        iyy="3.6499E-06"
+        iyz="-1.9481E-13"
+        izz="1.1611E-06" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_lf_foot.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.89804 0.91765 0.92941 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_lf_foot.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="j_lf_foot"
+    type="revolute">
+    <origin
+      xyz="0.17 0 0"
+      rpy="0 0 0" />
+    <parent
+      link="l_lf_ankle" />
+    <child
+      link="l_lf_foot" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="0"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="l_lf_suck">
+    <inertial>
+      <origin
+        xyz="2.402E-05 -6.3098E-06 -0.03601"
+        rpy="0 0 0" />
+      <mass
+        value="0.1974" />
+      <inertia
+        ixx="8.1471E-05"
+        ixy="-2.2607E-08"
+        ixz="3.1472E-09"
+        iyy="8.1391E-05"
+        iyz="-8.2675E-10"
+        izz="0.00012694" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_lf_suck.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.64706 0.61961 0.58824 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_lf_suck.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="j_lf_suck"
+    type="revolute">
+    <origin
+      xyz="0.00200000000000011 0 0"
+      rpy="3.14159265358979 -1.5707963267949 0" />
+    <parent
+      link="l_lf_foot" />
+    <child
+      link="l_lf_suck" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="0"
+      upper="0"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="l_rf_thigh">
+    <inertial>
+      <origin
+        xyz="0.061295 0.0012564 0.0008262"
+        rpy="0 0 0" />
+      <mass
+        value="0.33917" />
+      <inertia
+        ixx="0.00013181"
+        ixy="4.7259E-08"
+        ixz="-1.2865E-07"
+        iyy="0.00014472"
+        iyz="2.1038E-09"
+        izz="0.0001171" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_rf_thigh.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.89804 0.91765 0.92941 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_rf_thigh.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="j_rf_thigh"
+    type="revolute">
+    <origin
+      xyz="0.1 0.22 0"
+      rpy="0 0 0" />
+    <parent
+      link="body" />
+    <child
+      link="l_rf_thigh" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="0"
+      upper="0"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="l_rf_knee">
+    <inertial>
+      <origin
+        xyz="0.06409 0.00035638 -0.002743"
+        rpy="0 0 0" />
+      <mass
+        value="0.10815" />
+      <inertia
+        ixx="2.1373E-05"
+        ixy="-2.3627E-06"
+        ixz="5.7812E-09"
+        iyy="0.00019777"
+        iyz="7.1321E-09"
+        izz="0.00019435" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_rf_knee.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.49804 0.49804 0.49804 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_rf_knee.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="j_rf_knee"
+    type="revolute">
+    <origin
+      xyz="0.0720000000000062 0 0"
+      rpy="1.5707963267949 0 0" />
+    <parent
+      link="l_rf_thigh" />
+    <child
+      link="l_rf_knee" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="0"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="l_rf_ankle">
+    <inertial>
+      <origin
+        xyz="0.036625 0.00018626 -0.0013568"
+        rpy="0 0 0" />
+      <mass
+        value="0.38533" />
+      <inertia
+        ixx="0.00010682"
+        ixy="-3.6099E-07"
+        ixz="4.8551E-07"
+        iyy="0.00046097"
+        iyz="7.6644E-08"
+        izz="0.00048066" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_rf_ankle.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.89804 0.91765 0.92941 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_rf_ankle.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="j_rf_ankle"
+    type="revolute">
+    <origin
+      xyz="0.129999999999994 0 0"
+      rpy="0 0 0" />
+    <parent
+      link="l_rf_knee" />
+    <child
+      link="l_rf_ankle" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="0"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="l_rf_foot">
+    <inertial>
+      <origin
+        xyz="0.00070019 1.0042E-09 3.6082E-16"
+        rpy="0 0 0" />
+      <mass
+        value="0.030541" />
+      <inertia
+        ixx="4.4921E-06"
+        ixy="-2.2691E-15"
+        ixz="-1.5724E-14"
+        iyy="3.6746E-06"
+        iyz="-1.9481E-13"
+        izz="1.1859E-06" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_rf_foot.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.79216 0.81961 0.93333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_rf_foot.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="j_rf_foot"
+    type="revolute">
+    <origin
+      xyz="0.17 0 0"
+      rpy="0 0 0" />
+    <parent
+      link="l_rf_ankle" />
+    <child
+      link="l_rf_foot" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="0"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="l_rf_suck">
+    <inertial>
+      <origin
+        xyz="1.5055E-05 -1.9752E-05 -0.03601"
+        rpy="0 0 0" />
+      <mass
+        value="0.1974" />
+      <inertia
+        ixx="8.1419E-05"
+        ixy="-4.4354E-08"
+        ixz="1.9725E-09"
+        iyy="8.1443E-05"
+        iyz="-2.5879E-09"
+        izz="0.00012694" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_rf_suck.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.29804 0.29804 0.29804 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://hex_visual/meshes/l_rf_suck.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="j_rf_suck"
+    type="revolute">
+    <origin
+      xyz="0.0020000000001108 0 0"
+      rpy="3.14159265358979 1.5707963267949 0" />
+    <parent
+      link="l_rf_foot" />
+    <child
+      link="l_rf_suck" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="0"
+      upper="0"
+      effort="0"
+      velocity="0" />
+  </joint>
+</robot>
