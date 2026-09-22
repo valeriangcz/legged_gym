@@ -3,7 +3,8 @@
         "/opt/ros/humble/lib/python3.10/site-packages/"
     ],
     "python.analysis.extraPaths": [
-        "/opt/ros/humble/lib/python3.10/site-packages/"
+        "/opt/ros/humble/lib/python3.10/site-packages/",
+        // "/home/val/valerian_ws/env_gym/IsaacGym_Preview_4_Package/isaacgym/python/"
     ],
     "python-envs.defaultEnvManager": "ms-python.python:conda",
     "python-envs.defaultPackageManager": "ms-python.python:conda"

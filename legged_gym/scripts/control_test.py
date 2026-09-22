@@ -20,9 +20,6 @@ from torch.utils.tensorboard import SummaryWriter
 
 from collections import deque
 
-import rospy
-from std_msgs.msg import Float32MultiArray
-
 import statistics
 
 import os
@@ -127,15 +124,6 @@ def Expert_Play(env:HexClimb,cfg:HexGroundCfg,mode):
             reset=False
 
         else:
-            # dof_pos_expect = expert.ProcessCommand(command,dof_pos_cur)
-            #使用ros进行可视化
-            base_msgs.data.extend(env.base_lin_vel[0])#xyz
-            base_msgs.data.extend(command[0][1:4])
-
-            base_pub.publish(base_msgs)
-            base_msgs.data=[]
-
-
             # print("dof_pos_expect=",dof_pos_expect)
             # actions = (dof_pos_expect-env.default_dof_pos)/cfg.control.action_scale
             env.commands[:,0]=vx
@@ -180,10 +168,6 @@ def Expert_Play(env:HexClimb,cfg:HexGroundCfg,mode):
             #     print(f"commands mean={obs_mean[78:81]}, std={obs_std[78:81]}, max={obs_max[78:81]}, min={obs_min[78:81]}")
             #     obs_list=[]        
 
-            # joint_msgs.data.clear()
-            # joint_msgs.data.extend(env.dof_pos_des[0,0:4])
-            # joint_msgs.data.extend(env.dof_pos[0,0:4])
-            # joint_pub.publish(joint_msgs)
         obs_list.append(obs)
         time_steps+=1
 
@@ -298,10 +282,6 @@ def BC_play(env:HexGround,env_cfg,train_cfg,device='cpu'):
                 # actions = torch.randn_like(actions)*0.3+actions
                 obs,priv_obs,reward,dones,infos = env.step(actions)
 
-                base_msgs.data.extend(env.root_states[0,7:9].cpu().numpy())#xyz
-                base_msgs.data.extend([vx,vy])
-                base_pub.publish(base_msgs)
-                base_msgs.data=[]
                 # writer.add_scalars('BC',{
                 #                     'vx':env.base_lin_vel[0,0],
                 #                     'vy':env.base_lin_vel[0,1],
@@ -316,7 +296,6 @@ def BC_play(env:HexGround,env_cfg,train_cfg,device='cpu'):
             time_steps+=1
 
 def Hex_Resudule_Play(env:HexResidule,env_cfg:HexResiduleCfg,train_cfg,device='cpu'):
-    global last_dof_vel
     if env.num_privileged_obs==None:
         env.num_privileged_obs=env.num_obs
     actor_critic = ActorCritic(env.num_obs,env.num_privileged_obs,
@@ -352,24 +331,6 @@ def Hex_Resudule_Play(env:HexResidule,env_cfg:HexResiduleCfg,train_cfg,device='c
 
                 actions = actor_critic.act_inference(obs)
                 obs,priv_obs,reward,dones,infos = env.step(actions)
-                pos_des=(env.expert_actions + actions)[0]
-
-                base_msgs.data.extend(env.base_lin_vel[0])#xyz
-                base_msgs.data.extend([vx,vy,0])
-                base_msgs.data.append(yaw)
-                base_msgs.data.append(env.base_ang_vel[0,2])
-                joint_msgs.data.extend(pos_des[0:3])
-                joint_msgs.data.extend(env.dof_pos[0,0:3])
-                joint_msgs.data.extend(env.dof_vel[0,0:3])
-                joint_msgs.data.extend(((env.dof_vel-last_dof_vel)/env.dt)[0,0:3])
-                last_dof_vel[:]=env.dof_vel[:]
-
-                
-                
-                base_pub.publish(base_msgs)
-                joint_pub.publish(joint_msgs)
-                base_msgs.data=[] 
-                joint_msgs.data=[]
                 # writer.add_scalars('RL',{
                 #                     'vx':env.base_lin_vel[0,0],
                 #                     'vy':env.base_lin_vel[0,1],
@@ -379,12 +340,7 @@ def Hex_Resudule_Play(env:HexResidule,env_cfg:HexResiduleCfg,train_cfg,device='c
                 #         [env.dof_pos[0,0],env.dof_pos[0,1],env.dof_pos[0,2]],
                 #         time_steps)
             time_steps+=1
-            # debug_msgs.data.extend([vx,vy,0])
-            # debug_msgs.data.extend(env.base_lin_vel[0].cpu().numpy())
-            # pub.publish(debug_msgs)
-            # debug_msgs.data=[]
 def Hex_Ground_Play(env:HexGround,env_cfg:HexGroundCfg,train_cfg,device='cpu'):
-    global last_dof_vel
     if env.num_privileged_obs==None:
         env.num_privileged_obs=env.num_obs
     actor_critic = ActorCritic(env.num_obs,env.num_privileged_obs,
@@ -459,24 +415,6 @@ def Hex_Ground_Play(env:HexGround,env_cfg:HexGroundCfg,train_cfg,device='cpu'):
                     for key in infos['episode'].keys():
                         print(f"episode_info: {key}={infos['episode'][key]}")
 
-                pos_des=(actions*env.cfg.control.action_scale+env.default_dof_pos)[0]
-                
-                base_msgs.data.extend(env.base_lin_vel[0])#xyz
-                base_msgs.data.extend([vx,vy,0])
-                base_msgs.data.append(yaw)
-                base_msgs.data.append(env.base_ang_vel[0,2])
-                joint_msgs.data.extend(pos_des[0:3])
-                joint_msgs.data.extend(env.dof_pos[0,0:3])
-                # joint_msgs.data.extend(env.dof_vel[0,0:3])
-                # joint_msgs.data.extend(((env.dof_vel-last_dof_vel)/env.dt)[0,0:3])
-                # last_dof_vel[:]=env.dof_vel[:]
-
-                
-                
-                base_pub.publish(base_msgs)
-                joint_pub.publish(joint_msgs)
-                base_msgs.data=[] 
-                joint_msgs.data=[]
                 # writer.add_scalars('RL',{
                 #                     'vx':env.base_lin_vel[0,0],
                 #                     'vy':env.base_lin_vel[0,1],
@@ -487,10 +425,6 @@ def Hex_Ground_Play(env:HexGround,env_cfg:HexGroundCfg,train_cfg,device='cpu'):
                 #         time_steps)
             obs_list.append(obs)
             time_steps+=1
-            # debug_msgs.data.extend([vx,vy,0])
-            # debug_msgs.data.extend(env.base_lin_vel[0].cpu().numpy())
-            # pub.publish(debug_msgs)
-            # debug_msgs.data=[]
 
 def Hex_Terrain_Play(env:HexGround, env_cfg:HexGroundCfg,train_cfg_dict,device='cpu'):
     actor_critic = ActorCriticEncoder(env.num_obs,env.num_actions,**train_cfg_dict['policy']).to(device)
@@ -552,24 +486,6 @@ def Hex_Terrain_Play(env:HexGround, env_cfg:HexGroundCfg,train_cfg_dict,device='
                 
 
 
-                pos_des=(actions*env.cfg.control.action_scale+env.default_dof_pos)[0]
-                
-                base_msgs.data.extend(env.base_lin_vel[0])#xyz
-                # estimates_xyz=obs_vgf_estimates[0,0:3]/env_cfg.normalization.obs_scales.lin_vel
-                # base_msgs.data.extend(estimates_xyz)
-                # obs_vgf_estimates[0,2]/env_cfg.commands.ranges.lin_vel_
-                base_msgs.data.extend([vx,vy])
-                joint_msgs.data.extend(env.dof_pos[0,0:3])
-                joint_msgs.data.extend(pos_des[0:3])
-
-                rb_msgs.data.extend(env.contact_forces[0,env.feet_indices[0],:]) #0个环境的第一个脚的xyz接触力
-                
-                base_pub.publish(base_msgs)
-                joint_pub.publish(joint_msgs)
-                rb_pub.publish(rb_msgs)
-                rb_msgs.data=[]
-                base_msgs.data=[] 
-                joint_msgs.data=[]
                 # writer.add_scalars('RL',{
                 #                     'vx':env.base_lin_vel[0,0],
                 #                     'vy':env.base_lin_vel[0,1],
@@ -579,13 +495,8 @@ def Hex_Terrain_Play(env:HexGround, env_cfg:HexGroundCfg,train_cfg_dict,device='
                 #         [env.dof_pos[0,0],env.dof_pos[0,1],env.dof_pos[0,2]],
                 #         time_steps)
             time_steps+=1
-            # debug_msgs.data.extend([vx,vy,0])
-            # debug_msgs.data.extend(env.base_lin_vel[0].cpu().numpy())
-            # pub.publish(debug_msgs)
-            # debug_msgs.data=[]
 
 def Hex_Climb_Play(env:HexClimb, env_cfg:HexClimbCfg, train_cfg, device='cpu'):
-    global last_dof_vel
     if env.num_privileged_obs==None:
         env.num_privileged_obs=env.num_obs
     actor_critic = ActorCritic(env.num_obs,env.num_privileged_obs,
@@ -633,14 +544,6 @@ def Hex_Climb_Play(env:HexClimb, env_cfg:HexClimbCfg, train_cfg, device='cpu'):
                         for key in infos['episode'].keys():
                             print(f"episode_info: {key}={infos['episode'][key]}")
                     
-
-
-
-                    joint_msgs.data.clear()
-                    joint_msgs.data.extend(env.dof_pos_des[0,0:4])
-                    joint_msgs.data.extend(env.dof_pos[0,0:4])
-                    joint_pub.publish(joint_msgs)
-
 if __name__ == '__main__':
     mode = 'expert_ground'
     for i, arg in enumerate(sys.argv):
@@ -710,17 +613,6 @@ if __name__ == '__main__':
     #用于记录tensorboard
     # log_data_dir=f"{LEGGED_GYM_ROOT_DIR}/logs/motion_data"
     # writer = SummaryWriter(log_data_dir,flush_secs=7)
-
-    rospy.init_node('control_test', anonymous=True)
-    base_msgs=Float32MultiArray()
-    joint_msgs=Float32MultiArray()
-    rb_msgs=Float32MultiArray()
-    base_pub = rospy.Publisher('/base_msg',Float32MultiArray,queue_size=10)
-    joint_pub = rospy.Publisher('/joint_msg',Float32MultiArray,queue_size=10)
-    rb_pub = rospy.Publisher('/rb_msg',Float32MultiArray,queue_size=10)
-    base_msgs.data=[] #real xyz omega_z expected x y omega_z
-    joint_msgs.data=[]
-    last_dof_vel=torch.zeros_like(env.dof_vel)
 
     command_sequence = torch.load("/home/val/BIH_ws/bag/command_sequence.pth",weights_only=True,map_location=device)
 

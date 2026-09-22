@@ -18,9 +18,12 @@ legged_gym/expert_complex_utils/point_map.py
 legged_gym/expert_complex_utils/se3_AStar.py
 legged_gym/expert_complex_utils/se3_LazyPRM.py
 legged_gym/expert_complex_utils/se3_RRTconnect.py
+legged_gym/expert_complex_utils/se3_path_vis.py
 legged_gym/expert_complex_utils/se3_planning.py
 legged_gym/expert_complex_utils/se3_post_process.py
 legged_gym/expert_complex_utils/test_.py
+legged_gym/expert_complex_utils/test_se3_path_vis.py
+legged_gym/expert_complex_utils/test_se3_post_process.py
 legged_gym/expert_complex_utils/test_val.py
 legged_gym/utils/__init__.py
 legged_gym/utils/actuator.py

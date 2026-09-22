@@ -193,35 +193,36 @@ class HexClimb(LeggedRobot):
             self.expert_actions[:,:24] = expert_dofs
         return self.expert_actions.detach()
 
-    def create_sim(self):
-        self.up_axis_idx = 2
-        self.sim = self.gym.create_sim(self.sim_device_id, self.graphics_device_id, self.physics_engine, self.sim_params)
-        #创造STL文件创建的地形
-        #先创建一个地面
-        # self._create_ground_plane()
-        #使用trimesh读取STL文件 读取文件对应的边和三角面片 然后使用这些加载到isaacgym中
-        file = self.cfg.terrain.stl_files
-        # file = os.path.join(LEGGED_GYM_ROOT_DIR,"resources/environments/sutructure1/complex_surface.STL")
-        # file = "/home/val/BIH_ws/legged_gym/resources/environments/sutructure1/complex_surface.STL"
-        print(f"file={file}")
-        _mesh = trimesh.load(file,force="mesh")
-        vertices = np.asarray(_mesh.vertices,dtype=np.float32)
-        triangles = np.asarray(_mesh.faces,dtype=np.uint32)
-        tm_params = gymapi.TriangleMeshParams()
-        tm_params.nb_vertices = vertices.shape[0]
-        tm_params.nb_triangles = triangles.shape[0]
+    """以下create_sim是用于面向复杂结构中攀爬，创建复杂地形展开的"""
+    # def create_sim(self):
+    #     self.up_axis_idx = 2
+    #     self.sim = self.gym.create_sim(self.sim_device_id, self.graphics_device_id, self.physics_engine, self.sim_params)
+    #     #创造STL文件创建的地形
+    #     #先创建一个地面
+    #     # self._create_ground_plane()
+    #     #使用trimesh读取STL文件 读取文件对应的边和三角面片 然后使用这些加载到isaacgym中
+    #     file = self.cfg.terrain.stl_files
+    #     # file = os.path.join(LEGGED_GYM_ROOT_DIR,"resources/environments/sutructure1/complex_surface.STL")
+    #     # file = "/home/val/BIH_ws/legged_gym/resources/environments/sutructure1/complex_surface.STL"
+    #     print(f"file={file}")
+    #     _mesh = trimesh.load(file,force="mesh")
+    #     vertices = np.asarray(_mesh.vertices,dtype=np.float32)
+    #     triangles = np.asarray(_mesh.faces,dtype=np.uint32)
+    #     tm_params = gymapi.TriangleMeshParams()
+    #     tm_params.nb_vertices = vertices.shape[0]
+    #     tm_params.nb_triangles = triangles.shape[0]
 
-        tm_params.transform.p.x = 0
-        tm_params.transform.p.y = 0
-        tm_params.transform.p.z = 0
+    #     tm_params.transform.p.x = 0
+    #     tm_params.transform.p.y = 0
+    #     tm_params.transform.p.z = 0
 
-        tm_params.static_friction = self.cfg.terrain.static_friction
-        tm_params.dynamic_friction = self.cfg.terrain.dynamic_friction
+    #     tm_params.static_friction = self.cfg.terrain.static_friction
+    #     tm_params.dynamic_friction = self.cfg.terrain.dynamic_friction
 
-        self.gym.add_triangle_mesh(self.sim,vertices.flatten(order='C'),triangles.flatten(order='C'),tm_params)
+    #     self.gym.add_triangle_mesh(self.sim,vertices.flatten(order='C'),triangles.flatten(order='C'),tm_params)
 
 
-        self._create_envs()
+    #     self._create_envs()
 
     def _init_buffers(self):
         """ Initialize torch tensors which will contain simulation states and processed quantities
