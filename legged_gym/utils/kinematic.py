@@ -20,7 +20,21 @@ class Kinematic:
 
     def DampInvJac(self,joints):
         """joints:[batch_size,3],parallel_num:batch_size return [batch_size,3,3]"""
-        Jac=torch.zeros(joints.shape[0],3,3,dtype=torch.float32,device=self.device)
+        Jac=self.Jacobian(joints)
+        JJT=Jac@Jac.transpose(1,2)+torch.eye(3,3,dtype=torch.float32,device=self.device)*0.0001
+        return Jac.transpose(1,2)@torch.inverse(JJT)
+
+    def Jacobian(self,joints):
+        """Return the foot-position Jacobian for batched three-joint legs.
+
+        Args:
+            joints: ``(batch_size, 3)`` joint angles.
+
+        Returns:
+            ``(batch_size, 3, 3)`` tensors whose rows are Cartesian axes and
+            columns are joints.
+        """
+        Jac=torch.zeros(joints.shape[0],3,3,dtype=joints.dtype,device=joints.device)
         q1=joints[:,0]
         q2=joints[:,1]
         q3=joints[:,2]
@@ -35,8 +49,7 @@ class Kinematic:
         Jac[:,0,2]=-self.l3*cos(q1)*sin(q2+q3)
         Jac[:,1,2]=-self.l3*sin(q1)*sin(q2+q3)
         Jac[:,2,2]=self.l3*cos(q2+q3)
-        JJT=Jac@Jac.transpose(1,2)+torch.eye(3,3,dtype=torch.float32,device=self.device)*0.0001
-        return Jac.transpose(1,2)@torch.inverse(JJT)
+        return Jac
 
     def InverseKin1(self,pos:torch.Tensor,joints_cur:torch.Tensor):
         """use iterative jacobian to get desired joints, joints_cur is modified to the desired joints"""

@@ -84,7 +84,7 @@ def Expert_Play(env:HexClimb,cfg:HexGroundCfg,mode):
     time_steps=0
     sim_params = env.gym.get_sim_params(env.sim)
 
-    obs_list = []
+    # obs_list = []
     while not env.gym.query_viewer_has_closed(env.viewer):
         vx,vy,yaw=GenCommand(time_steps)
         # reset,vx,vy,vz,yaw =joystick.get_commands()
@@ -92,16 +92,16 @@ def Expert_Play(env:HexClimb,cfg:HexGroundCfg,mode):
         vy = cfg.commands.ranges.lin_vel_y[1]*vy
         yaw = cfg.commands.ranges.ang_vel_yaw[1]*yaw
 
-        if time_steps>= 10/env.dt:
-            torch.save(obs_list,"/home/val/BIH_ws/legged_gym/logs-val/expert.pth")
-            exit(0)
+        # if time_steps>= 10/env.dt:
+        #     torch.save(obs_list,"/home/val/BIH_ws/legged_gym/logs-val/expert.pth")
+        #     exit(0)
         # print("commands",vx,vy)
         # if time_steps%(7/0.02)==0 and time_steps>0:
         #     reset=True
         # if time_steps > 21/0.02:
         #     print("time ends")
         #     exit(0)
-        command = torch.tensor([[reset,vx,vy,0,yaw]],dtype=torch.float,device=env.device)
+        # command = torch.tensor([[reset,vx,vy,0,yaw]],dtype=torch.float,device=env.device)
         # command = command.repeat(env.num_envs,1)
         # print("command=",command)
         # props = env.gym.get_actor_rigid_shape_properties(env.envs[0],env.actor_handles[0])
@@ -130,13 +130,17 @@ def Expert_Play(env:HexClimb,cfg:HexGroundCfg,mode):
             env.commands[:,1]=vy
             env.commands[:,2]=yaw
             # env.reset_buf.fill_(reset)
-            expert_actions=env.get_expert_actions()
-            #为专家动作添加正态分布噪声
-            # expert_actions += torch.randn_like(expert_actions)*0.1
-            if mode == 'expert_ground' or mode == 'expert_climb':
-                obs,_,reward,dones,infos = env.step(expert_actions)
-            elif mode =='expert_terrain':
-                _,_,_,reward,dones,infos = env.step_separate(expert_actions)
+            if mode == 'expert_climb':
+                q_des, tau_ff, adhesions = env.get_expert_commands()
+                obs,_,reward,dones,infos = env.step_q_tao(q_des,tau_ff,adhesions)
+            else:
+                expert_actions=env.get_expert_actions()
+                #为专家动作添加正态分布噪声
+                # expert_actions += torch.randn_like(expert_actions)*0.1
+                if mode == 'expert_ground':
+                    obs,_,reward,dones,infos = env.step(expert_actions)
+                elif mode =='expert_terrain':
+                    _,_,_,reward,dones,infos = env.step_separate(expert_actions)
             # dof_pos_cur=env.dof_pos
 
             #统计专家能获取多少奖励
@@ -168,7 +172,7 @@ def Expert_Play(env:HexClimb,cfg:HexGroundCfg,mode):
             #     print(f"commands mean={obs_mean[78:81]}, std={obs_std[78:81]}, max={obs_max[78:81]}, min={obs_min[78:81]}")
             #     obs_list=[]        
 
-        obs_list.append(obs)
+        # obs_list.append(obs)
         time_steps+=1
 
 
@@ -614,7 +618,7 @@ if __name__ == '__main__':
     # log_data_dir=f"{LEGGED_GYM_ROOT_DIR}/logs/motion_data"
     # writer = SummaryWriter(log_data_dir,flush_secs=7)
 
-    command_sequence = torch.load("/home/val/BIH_ws/bag/command_sequence.pth",weights_only=True,map_location=device)
+    # command_sequence = torch.load("/home/val/BIH_ws/bag/command_sequence.pth",weights_only=True,map_location=device)
 
 
 

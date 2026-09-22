@@ -74,7 +74,7 @@ class HexClimb(LeggedRobot):
         # step physics and render each frame
         self.render()
 
-        #每0.02s计算一次吸附力
+        #每0.01s计算一次吸附力
         self.rb_forces = self._compute_adhesions(self.actions)
 
         for _ in range(self.cfg.control.decimation):
@@ -161,13 +161,14 @@ class HexClimb(LeggedRobot):
         if self.cfg.noise.add_noise:
             self.obs_buf += torch.rand_like(self.noise_scale_vec) * self.noise_scale_vec
     
-    def get_expert_actions(self,action_scaled=True):
-        """
-        action_scaled=True返回的是经过减去默认值和缩放后的action
+    def get_expert_commands(self):
+        """Return absolute expert commands, including main-motor feedforward.
 
-        action_scaled=False返回的是关节的期望值，没有经过任何处理
+        Returns:
+            q_des: ``(num_envs, 24)`` absolute position targets.
+            tau_ff: ``(num_envs, 18)`` feedforward torque for main motors.
+            adhesions: ``(num_envs, 6)`` adsorption switches.
         """
-        #获取专家动作 
         command = torch.stack([self.reset_buf.clone(),
                                self.commands[:,0],
                                self.commands[:,1],
@@ -177,13 +178,22 @@ class HexClimb(LeggedRobot):
         q_dot_cur = self.dof_vel[:,self.dof_motor_drive_indices].clone()
         adhesion_force = self.rb_forces[:,self.feet_indices,2].clone().abs()
         contact_force = self.contact_forces[:,self.feet_indices,2].clone().abs()
-        
-        # 动作中包含吸附力
-        self.expert_actions[:,24:30], expert_dofs = self.expert.ProcessCommand(command,q_cur,q_dot_cur,adhesion_force,contact_force)
-        
-        #从动作中取消吸附力
-        # adhesion_force[self.adhesions]=self.cfg.control.suction_force_max
-        # self.adhesions, expert_dofs = self.expert.ProcessCommand(command,q_cur,q_dot_cur,adhesion_force,contact_force)
+        gravity_R = self.projected_gravity*9.81
+        adhesions, q_des, tau_ff = self.expert.ProcessCommand(
+            command,q_cur,q_dot_cur,adhesion_force,contact_force,gravity_R
+        )
+        return q_des.detach(), tau_ff.detach(), adhesions.detach()
+
+    def get_expert_actions(self,action_scaled=True):
+        """
+        action_scaled=True返回的是经过减去默认值和缩放后的action
+
+        action_scaled=False返回的是关节的期望值，没有经过任何处理
+        """
+        expert_dofs, _, adhesions = self.get_expert_commands()
+        # 动作中包含吸附力；前馈扭矩通过 get_expert_commands 单独提供，
+        # 以保持策略和已有专家数据的 30 维动作接口不变。
+        self.expert_actions[:,24:30] = adhesions
 
         # print("expert dof pos.shape=",expert_dofs.shape)
         # print("adhesion_force=",adhesion_force)
@@ -270,8 +280,8 @@ class HexClimb(LeggedRobot):
         self.pos_rb_forces = torch.zeros_like(self.contact_forces) #指定给足施加吸附力的位置
         env_indices = torch.arange(self.num_envs,dtype=torch.long,device=self.device).unsqueeze(1)
         self.pos_rb_forces[env_indices,self.magnetic_indices[:,0].unsqueeze(0),:] = torch.tensor([0,0.02,-0.009],device=self.device,dtype=torch.float)
-        self.pos_rb_forces[env_indices,self.magnetic_indices[:,1].unsqueeze(1),:] = torch.tensor([0.02 * 3**0.5,-0.01,0],device=self.device,dtype=torch.float)
-        self.pos_rb_forces[env_indices,self.magnetic_indices[:,2].unsqueeze(1),:] = torch.tensor([-0.02 * 3**0.5,-0.01,0],device=self.device,dtype=torch.float)
+        self.pos_rb_forces[env_indices,self.magnetic_indices[:,1].unsqueeze(1),:] = torch.tensor([0.02 * 3**0.5,-0.01,-0.009],device=self.device,dtype=torch.float)
+        self.pos_rb_forces[env_indices,self.magnetic_indices[:,2].unsqueeze(1),:] = torch.tensor([-0.02 * 3**0.5,-0.01,-0.009],device=self.device,dtype=torch.float)
         self.dof_pos_des = torch.zeros_like(self.dof_pos) #这里是关节期望的角度，包含了被动关节，其期望值一直为0
         # self.adhesions = torch.zeros(self.num_envs,6,dtype=torch.bool,device=self.device,requires_grad=False)
 
@@ -464,7 +474,7 @@ class HexClimb(LeggedRobot):
         contacts = torch.norm(self.contact_forces[:,self.feet_indices,:],dim=-1) > 1.0
         contacts_filt = contacts | self.last_contacts
         self.last_contacts = contacts
-
+        
         #actions的后六位是吸附力的大小
         adhesions = actions[:,24:30].clone()
 

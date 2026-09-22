@@ -8,7 +8,7 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "args": [
-                "--sim_device=cpu"
+                "--sim_device=cpu --mode=expert_climb"
             ]
         }
     ]

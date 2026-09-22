@@ -38,8 +38,8 @@ class HexClimbCfg(LeggedRobotCfg):
         #                 "slope":-0.5,
         #                 "platform_size":2}        
         slope_treshold=0.8
-        static_friction = 0.5
-        dynamic_friction = 0.4
+        static_friction = 0.7
+        dynamic_friction = 0.7
 
         stl_files = os.path.join(LEGGED_GYM_ROOT_DIR,"resources/environments/sutructure1/complex_surface.STL")
 
@@ -90,7 +90,7 @@ class HexClimbCfg(LeggedRobotCfg):
                     _joint = 0.0
                 default_joint_angles['j_'+t+'_' + qn]=_joint
         #缓冲时间 ，在设定时间不会检查终止条件，同时直接给adhesion的足端设定最大吸附力
-        buffer_time = 10.0 #s
+        buffer_time = 1.0 #s
     class control(LeggedRobotCfg.control):
         use_actuator_net = False
         # use_actuator_net = True
@@ -106,18 +106,18 @@ class HexClimbCfg(LeggedRobotCfg):
         for t in _tao:
             for qn in _q_name:
                 if qn in ['thigh','knee','ankle']:
-                    stiffness['j_'+t+'_' + qn]=60.0
+                    stiffness['j_'+t+'_' + qn]=100.0
                     damping['j_'+t+'_'+qn] = 1.0
                 elif qn == 'foot':
                     stiffness['j_'+t+'_' + qn]=20.0
                     damping['j_'+t+'_'+qn] = 0.3
                 else:
-                    stiffness['j_'+t+'_' + qn]=5.0
-                    damping['j_'+t+'_'+qn] = 0.1                  
+                    stiffness['j_'+t+'_' + qn]=3.0
+                    damping['j_'+t+'_'+qn] = 0.2                  
         action_scale=1.2
         decimation = 4
-        suction_force_delt=5 #每0.01s，释放时减少的力，吸附时吸力变化是其5倍
-        suction_force_max=300.0 #300N是最电磁铁大吸附力
+        suction_force_delt=200 #每0.01s，释放时减少的力，吸附时吸力变化是其5倍
+        suction_force_max=100.0 #300N是最电磁铁大吸附力
 
     class asset(LeggedRobotCfg.asset):
         file=f"{LEGGED_GYM_ROOT_DIR}/resources/robots/hex_v4/urdf/hex_climb.urdf"
@@ -225,10 +225,10 @@ class HexClimbCfg(LeggedRobotCfg):
     
     class viewer(LeggedRobotCfg.viewer):
         ref_env = 0
-        # pos = [1.2,3,1.5]
-        # lookat = [0.9,2,1.0]
-        pos = [0.0,3,1.5]
-        lookat = [1.2,4.1,0.65]        
+        pos = [1.2,3,1.5]
+        lookat = [0.9,2,1.0]
+        # pos = [0.0,3,1.5]
+        # lookat = [1.2,4.1,0.65]        
         
     class sim(LeggedRobotCfg.sim):
         dt = 0.0025

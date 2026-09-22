@@ -56,6 +56,19 @@ class ExpertClimb:
         self.adhesions=torch.zeros(env_nums,6,dtype=torch.bool,device=device)
         self.q_des=torch.zeros(env_nums,6,4,dtype=torch.float32,device=device)
         self.q_des_flat=self.q_des.view(env_nums*6,4)
+        # 准静态支撑前馈：在机身 R 系分配接触力，再映射到腿局部
+        # Jacobian。参数与 hex_climb.urdf 和 ExpertComplex 保持一致。
+        self.total_mass = 14.530042
+        # self.total_mass = 10.5     
+        self.R_body_com = torch.tensor([0.0014417,0.043319,0.0041358],
+                                       dtype=torch.float32,device=device)
+        self.motor_torque_limit = 27.0
+        self.tau_ff = torch.zeros(env_nums,6,3,dtype=torch.float32,device=device)
+        self.static_contact_forces_R = torch.zeros_like(self.tau_ff)
+        self._tau_ff_stance_mask = torch.zeros(env_nums,6,dtype=torch.bool,device=device)
+        self._tau_ff_transition_start = torch.zeros_like(self.tau_ff)
+        self._tau_ff_transition_steps = max(1,int(round(0.1/self.dt)))
+        self._tau_ff_transition_remaining = torch.zeros(env_nums,dtype=torch.int64,device=device)
 
         #init outer tensors for multi-env
         # self.q_des=joint_pos_des # env_nums*6*4 float32 tensor
@@ -90,18 +103,19 @@ class ExpertClimb:
         
         # print("-------------initial B_e_des-------------\n",self.B_e_des)
 
-
     # def ResetJoint(self,env_indx:torch.Tensor):
     #     self.set_init_done[env_indx]=False
 
     def ProcessCommand(self,command:torch.Tensor,
                        q_cur:torch.Tensor,q_dot_cur:torch.Tensor,
                        suction_forces:torch.Tensor,
-                       contact_forces:torch.Tensor)->Tuple[torch.Tensor,torch.Tensor]:
+                       contact_forces:torch.Tensor,
+                       gravity_R:torch.Tensor)->Tuple[torch.Tensor,torch.Tensor,torch.Tensor]:
         """
         @input: command [set_init,vx,vy,vz,omega], q_cur suction_force
 
-        @output: adhesions env_nums*6, q_des_flat env_nums*24
+        @input gravity_R: gravity vector in each robot body R frame, ``(N, 3)``.
+        @output: adhesions ``(N, 6)``, q_des ``(N, 24)``, tau_ff ``(N, 18)``.
         """
         #update current position of foot end in leg base frame
         q_cur_flat=q_cur.view(self.env_nums*6,3)
@@ -123,6 +137,11 @@ class ExpertClimb:
             self.B_e_des[reset_index,...]=self.B_e_init
             self.adhesions[reset_index,...]=0
             self.adhesions[reset_index.unsqueeze(-1),self.A_group_index]=1
+            self.tau_ff[reset_mask]=0.0
+            self.static_contact_forces_R[reset_mask]=0.0
+            self._tau_ff_stance_mask[reset_mask]=False
+            self._tau_ff_transition_start[reset_mask]=0.0
+            self._tau_ff_transition_remaining[reset_mask]=0
             #judge footend if reach desired point
             reset_done_mask=(torch.norm((self.B_e_des-self.B_e_cur),p=2,dim=2)<0.02).all(dim=1)
             reset_done_mask.fill_(True)
@@ -133,9 +152,104 @@ class ExpertClimb:
             self.GaitPlanning(command,suction_forces,contact_forces)
             self.CalJointPoses(q_cur_flat,q_dot_cur_flat)
             # print("in expert suction_forces=",suction_forces)
+
+        self._ComputeQuasiStaticTauFF(q_cur_flat,gravity_R)
         
         # print("in expert, self.adhesions.shape=",self.adhesions.shape)
-        return self.adhesions,self.q_des_flat.view(self.env_nums,24)
+        return (self.adhesions,
+                self.q_des_flat.view(self.env_nums,24),
+                self.tau_ff.view(self.env_nums,18))
+
+    @staticmethod
+    def _Skew(vectors:torch.Tensor)->torch.Tensor:
+        """Return batched cross-product matrices for ``vectors`` shaped ``(N, 3)``."""
+        x,y,z = vectors.unbind(dim=-1)
+        zeros = torch.zeros_like(x)
+        return torch.stack((
+            torch.stack((zeros,-z,y),dim=-1),
+            torch.stack((z,zeros,-x),dim=-1),
+            torch.stack((-y,x,zeros),dim=-1),
+        ),dim=-2)
+
+    def _ComputeQuasiStaticTauFF(self,q_cur_flat:torch.Tensor,
+                                 gravity_R:torch.Tensor)->torch.Tensor:
+        """Compute and smooth stance-leg quasi-static motor feedforward torque.
+
+        Contact forces are solved in the body R frame from force/moment
+        equilibrium. They are then rotated into each leg frame before applying
+        ``tau = -J^T F``. Swing-leg target torque is always zero.
+        """
+        if gravity_R.shape != (self.env_nums,3):
+            raise ValueError(
+                f"gravity_R must have shape {(self.env_nums,3)}, got {tuple(gravity_R.shape)}"
+            )
+        if not torch.isfinite(gravity_R).all():
+            raise ValueError("gravity_R must be finite")
+
+        q_cur = q_cur_flat.view(self.env_nums,6,3)
+        # _B2R includes the leg-root translations, which must be retained when
+        # constructing the moment arms about the body center of mass.
+        R_foot = self._B2R(self.B_e_cur)[...,:3]
+        r_R = R_foot-self.R_body_com.view(1,1,3)
+
+        # Allocate one 3-D contact-force block per leg. Inactive blocks remain
+        # zero, which lets a single batched solve handle each gait grouping.
+        A = torch.zeros(self.env_nums,6,18,dtype=torch.float32,device=self.device)
+        eye = torch.eye(3,dtype=torch.float32,device=self.device)
+        skew_r = self._Skew(r_R.reshape(-1,3)).view(self.env_nums,6,3,3)
+        for leg in range(6):
+            block = slice(3*leg,3*leg+3)
+            active = self.gaits[:,leg].to(torch.float32).view(-1,1,1)
+            A[:,:3,block] = eye.view(1,3,3)*active
+            A[:,3:,block] = skew_r[:,leg]*active
+
+        b = torch.cat((-self.total_mass*gravity_R,
+                       torch.zeros(self.env_nums,3,dtype=torch.float32,device=self.device)),dim=1)
+        normal = A@A.transpose(1,2)
+        force_stack = A.transpose(1,2)@torch.linalg.pinv(normal)@b.unsqueeze(-1)
+        residual = (A@force_stack).squeeze(-1)-b
+        rank = torch.linalg.matrix_rank(A)
+        valid = ((self.gaits.sum(dim=1) >= 3) & (rank == 6)
+                 & torch.isfinite(force_stack).all(dim=(1,2))
+                 & (torch.linalg.vector_norm(residual,dim=1)
+                    <= 1e-5*torch.maximum(torch.ones(self.env_nums,device=self.device),
+                                            torch.linalg.vector_norm(b,dim=1))))
+
+        forces_R = force_stack.squeeze(-1).view(self.env_nums,6,3)
+        forces_R = torch.where(valid.view(-1,1,1),forces_R,torch.zeros_like(forces_R))
+        self.static_contact_forces_R.copy_(forces_R)
+
+        # For LB/LF/LM, B and R axes differ by a 180-degree z rotation; the
+        # right legs share R's axis orientation. Forces are vectors, so no leg
+        # root translation is applied here.
+        R_to_leg_sign = torch.tensor([[-1.,-1.,1.]]*3+[[1.,1.,1.]]*3,
+                                     dtype=torch.float32,device=self.device)
+        force_leg = forces_R*R_to_leg_sign.view(1,6,3)
+        jacobian = self.kin.Jacobian(q_cur.reshape(-1,3)).view(self.env_nums,6,3,3)
+        target_tau = -torch.einsum("...ij,...i->...j",jacobian,force_leg)
+        target_tau = target_tau*self.gaits.unsqueeze(-1)
+        target_tau = torch.clamp(target_tau,-self.motor_torque_limit,self.motor_torque_limit)
+
+        stance_changed = torch.any(self.gaits != self._tau_ff_stance_mask,dim=1)
+        if stance_changed.any():
+            self._tau_ff_transition_start[stance_changed] = self.tau_ff[stance_changed]
+            self._tau_ff_transition_remaining[stance_changed] = self._tau_ff_transition_steps
+            self._tau_ff_stance_mask[stance_changed] = self.gaits[stance_changed]
+
+        transition = self._tau_ff_transition_remaining > 0
+        if transition.any():
+            completed = (self._tau_ff_transition_steps
+                         -self._tau_ff_transition_remaining[transition]+1).to(torch.float32)
+            blend = (completed/self._tau_ff_transition_steps).view(-1,1,1)
+            self.tau_ff[transition] = (
+                (1.0-blend)*self._tau_ff_transition_start[transition]
+                +blend*target_tau[transition]
+            )
+            self._tau_ff_transition_remaining[transition] -= 1
+        if (~transition).any():
+            self.tau_ff[~transition] = target_tau[~transition]
+        self.tau_ff.clamp_(-self.motor_torque_limit,self.motor_torque_limit)
+        return self.tau_ff
             
     def GaitPlanning(self,command:torch.Tensor,suction_forces,contact_forces):
         # print(">>>>>>>>>>>>>GaitPlanning<<<<<<<<<<<<")
@@ -344,10 +458,17 @@ class ExpertClimb:
         self.swing_reach_point=(self.B_e_des[...,2]>=self.swing_init_point[0,2]-0.005) | self.swing_reach_point
         # self.swing_reach_point=((dis_norm<self.dt).sum(dim=1)==3) | self.swing_reach_point
         back_to_init_mask=(~self.swing_reach_point) & (~self.gaits)
-        v_z = torch.max(torch.norm(command[:,1:3],dim=1)*2.0 ,torch.abs(command[:,4])*1.2).clamp(max=1.2)
+        v_z = torch.max(torch.norm(command[:,1:3],dim=1)*1.5 ,torch.abs(command[:,4])*1.2).clamp(max=1.2)
 
         v_z = v_z.unsqueeze(1).expand(-1,6)
         # 对于contact的腿部，调整z的位置
+        #根据z的位置调整v_z大小 当z高于support_height/2的时候，
+        #保持当前，当低于的时候，设置从support_heigh/2.0到-0.16线性衰减到0
+        #env_nums,6
+        decay_rate = torch.clip((R_e_des[...,2]+0.16)/0.12,min=0,max=1.0)
+        v_z = v_z*decay_rate
+
+
 
         set_z_directly = (torch.abs(B_e_des_xyz[...,2]+self.stance_height)<self.dt*v_z*0.2) & (self.gaits)
         next_B_e_des[...,2][set_z_directly] = -self.stance_height
@@ -366,7 +487,7 @@ class ExpertClimb:
         sub_z_mask=~self.gaits&(self.swing_reach_point)
 
         next_B_e_des[...,2][sub_z_mask]-=v_z[sub_z_mask]*self.dt
-
+        print("next_B_e_dex\n",next_B_e_des)
         return next_B_e_des
 
     def _GetFootAngle(self,joint_pos:torch.Tensor):
@@ -408,7 +529,7 @@ class ExpertClimb:
 
     def _ContactDetection(self,next_B_e_des:torch.Tensor,foot_contact_force)->torch.Tensor:
         # swing reach the high point and z<-0.08
-        return ((foot_contact_force!=0)&(self.swing_reach_point)) | (next_B_e_des[...,2]<-0.16)
+        return ((foot_contact_force>2.0)&(self.swing_reach_point)) | (next_B_e_des[...,2]<-0.16)
         # return ((foot_contact_force!=0)&(self.swing_reach_point)) | (next_B_e_des[...,2]<-0.1) #取消吸附后修改
     
         # return (next_B_e_des[...,2]<-self.stance_height)&(self.swing_reach_point)
@@ -416,8 +537,8 @@ class ExpertClimb:
     
     def _AdsorbReleaseDetection(self,suction_forces)->torch.Tensor:
         # print("suction_forces:\n",self.suction_forces)
-        stance_release_done=self.gaits&(suction_forces<self.cfg.control.suction_force_max*0.05)
-        swing_adsorb_done=~self.gaits&(suction_forces>self.cfg.control.suction_force_max*0.85)
+        stance_release_done=self.gaits&(suction_forces<(self.cfg.control.suction_force_max/3.0)*0.05)
+        swing_adsorb_done=~self.gaits&(suction_forces>(self.cfg.control.suction_force_max/3.0)*0.85)
         # print("suction_forces:",suction_forces)
         # print("stance_release_done|swing_adsorb_done:\n",stance_release_done|swing_adsorb_done)
         #测试时，全设置为True
