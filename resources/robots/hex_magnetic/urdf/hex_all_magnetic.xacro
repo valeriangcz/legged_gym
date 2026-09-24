@@ -1,0 +1,477 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<robot name="hex_magnetic" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <link name="body">
+    <xacro:property name="mesh_type" value="course"/>
+    <!-- <xacro:property name="mesh_type" value="fine"/>     -->
+
+    <inertial>
+      <origin xyz="-0.00031149 -7.4441E-05 0.0027279" rpy="0 0 0" />
+      <mass value="6.023" />
+      <inertia ixx="0.169108146" ixy="-0.000168229" ixz="0.000016567" iyy="0.040037856" iyz="-0.001521188" izz="0.2016899" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../${mesh_type}_meshes/body.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.75294 0.75294 0.75294 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.01" rpy="0 0 0" />
+      <geometry>
+        <box size="0.2 0.5 0.12" />
+      </geometry>
+    </collision>
+  </link>
+
+  <xacro:macro name="right_leg" params="prefix y">
+    <link name="l_${prefix}_thigh">
+      <inertial>
+        <origin xyz="0.064054 0.00074864 0.0008765" rpy="0 0 0" />
+        <mass value="0.503" />
+        <inertia ixx="0.000308075" ixy="0.000008408" ixz="0.00002042" iyy="0.000459424" iyz="-0.000000879" izz="0.000399397" />
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="../${mesh_type}_meshes/l_rf_thigh.STL" />
+        </geometry>
+        <material name="">
+          <color rgba="0.89804 0.91765 0.92941 1" />
+        </material>
+      </visual>
+      <collision>
+        <!-- 以下是比较贴合thigh关节外部轮廓的 -->
+        <!-- <origin xyz="0.072 0.002 0" rpy="1.57 0 0" />
+        <geometry>
+          <cylinder length="0.078" radius="0.032" />
+        </geometry> -->
+        <!-- 以下是和碰撞检查接近，采用球体近似的 -->
+        <origin xyz="0.072 0 0" rpy="0 0 0"/>
+        <geometry>
+          <sphere radius="0.045"/>
+        </geometry>      
+      </collision>
+    </link>
+    <joint name="j_${prefix}_thigh" type="revolute">
+      <origin xyz="0.10 ${y} 0" rpy="0 0 0" />
+      <parent link="body" />
+      <child link="l_${prefix}_thigh" />
+      <axis xyz="0 0 1" />
+
+      <xacro:if value="${ prefix=='rm' }">
+        <limit lower="${-pi*2.0/9.0}" upper="${pi*2.0/9.0}" effort="27" velocity="5" />
+      </xacro:if>
+      <xacro:if value="${ prefix=='rb' }">
+        <limit lower="${-pi*19.0/36.0}" upper="${pi*5.0/18.0}" effort="27" velocity="5" />
+      </xacro:if>
+      <xacro:if value="${ prefix=='rf' }">
+        <limit lower="${-pi*5.0/18.0}" upper="${pi*19/36}" effort="27" velocity="5" />
+      </xacro:if>      
+
+    </joint>
+
+    <link name="l_${prefix}_knee">
+      <inertial>
+        <origin xyz="0.065 1.584E-06 -0.025152" rpy="0 0 0" />
+        <mass value="0.11208" />
+        <inertia ixx="0.000080839" ixy="0" ixz="-0.000000002" iyy="0.000370523" iyz="-0.000000012" izz="0.00032306" />
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="../${mesh_type}_meshes/l_rf_knee.STL" />
+        </geometry>
+        <material name="">
+          <color rgba="0.89804 0.91765 0.92941 1" />
+        </material>
+      </visual>
+      <!-- <collision>
+        <origin xyz="0.065 0 0" rpy="0 0 0" />
+        <geometry>
+          <box size="0.06 0.04 0.08" />
+        </geometry>
+      </collision> -->
+    </link>
+    <joint name="j_${prefix}_knee" type="revolute">
+      <origin xyz="0.072 0 0" rpy="1.5707963267949 0 0" />
+      <parent link="l_${prefix}_thigh" />
+      <child link="l_${prefix}_knee" />
+      <axis xyz="0 0 1" />
+      <limit lower="${-pi*7.0/9.0}" upper="${pi*27.0/36.0}" effort="27" velocity="5" />
+    </joint>
+
+    <link name="l_${prefix}_ankle">
+      <inertial>
+        <origin xyz="0.027105 0.00011827 -0.0030176" rpy="0 0 0" />
+        <mass value="0.57" />
+        <inertia ixx="0.000261833" ixy="0.000000534" ixz="0.000090538" iyy="0.001714163" iyz="-0.000000408" izz="0.001688987" />
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="../${mesh_type}_meshes/l_rf_ankle.STL" />
+        </geometry>
+        <material name="">
+          <color rgba="0.79216 0.81961 0.93333 1" />
+        </material>
+      </visual>
+      <collision>
+      <!-- 以下是比较贴合ankle关节外部轮廓的 -->
+        <!-- <origin xyz="0.06 0 0" rpy="0 0 0" />
+        <geometry>
+          <box size="0.165 0.06 0.08" />
+        </geometry> -->
+        <!-- 以下是和碰撞检查接近，采用球体近似的 -->
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <sphere radius="0.045"/>
+        </geometry>
+      </collision>
+    </link>
+    <joint name="j_${prefix}_ankle" type="revolute">
+      <origin xyz="0.13 0 0" rpy="0 0 0" />
+      <parent link="l_${prefix}_knee" />
+      <child link="l_${prefix}_ankle" />
+      <axis xyz="0 0 1" />
+      <limit lower="${-pi*5.0/6.0}" upper="${pi*11.0/12.0}" effort="27" velocity="5" />
+    </joint>
+
+    <link name="l_${prefix}_foot">
+      <inertial>
+        <origin xyz="0.00030471 -4.9558E-10 -0.00035688" rpy="0 0 0" />
+        <mass value="0.015" />
+        <inertia ixx="0.000001216" ixy="0" ixz="-0.000000002" iyy="0.000000892" iyz="0" izz="0.000000428" />
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="../${mesh_type}_meshes/l_rf_foot.STL" />
+        </geometry>
+        <material name="">
+          <color rgba="0.89804 0.91765 0.92941 1" />
+        </material>
+      </visual>
+      <!-- <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <sphere radius="0.035"/>
+        </geometry>
+      </collision> -->
+    </link>
+    <joint name="j_${prefix}_foot" type="revolute">
+      <origin xyz="0.17 0 0" rpy="0 0 0" />
+      <parent link="l_${prefix}_ankle" />
+      <child link="l_${prefix}_foot" />
+      <axis xyz="0 0 1" />
+      <limit lower="${-pi/2.0}" upper="${pi/2.0}" effort="0.45" velocity="${pi}" />
+    </joint>
+
+    <link name="l_${prefix}_suck_roll">
+      <inertial>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <mass value="0.001" />
+        <inertia ixx="0.0000001" ixy="0" ixz="0" iyy="0.0000001" iyz="0" izz="0.0000001" />
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <sphere radius="0.008" />
+        </geometry>
+        <material name="">
+          <color rgba="0.2 0.2 0.2 0.35" />
+        </material>
+      </visual>
+    </link>
+    <joint name="j_${prefix}_suck_roll" type="revolute">
+      <origin xyz="0.001 0 0" rpy="0 1.5707963267949 0" />
+      <parent link="l_${prefix}_foot" />
+      <child link="l_${prefix}_suck_roll" />
+      <axis xyz="1 0 0" />
+      <limit lower="${-pi/9.0}" upper="${pi/9.0}" effort="0.2" velocity="2" />
+    </joint>
+
+    <link name="l_${prefix}_suck_pitch">
+      <inertial>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <mass value="0.001" />
+        <inertia ixx="0.0000001" ixy="0" ixz="0" iyy="0.0000001" iyz="0" izz="0.0000001" />
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <sphere radius="0.008" />
+        </geometry>
+        <material name="">
+          <color rgba="0.2 0.2 0.2 0.35" />
+        </material>
+      </visual>
+    </link>
+    <joint name="j_${prefix}_suck_pitch" type="revolute">
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <parent link="l_${prefix}_suck_roll" />
+      <child link="l_${prefix}_suck_pitch" />
+      <axis xyz="0 1 0" />
+      <limit lower="${-pi/9.0}" upper="${pi/9.0}" effort="0.2" velocity="2" />
+    </joint>
+
+    <link name="l_${prefix}_suck">
+      <inertial>
+        <origin xyz="5.5511E-17 -6.9389E-18 0.019468" rpy="0 0 0" />
+        <mass value="0.203" />
+        <inertia ixx="0.000028634" ixy="0.000000004" ixz="0" iyy="0.000028269" iyz="0" izz="0.00004012" />
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="../${mesh_type}_meshes/l_rf_suck.STL" />
+        </geometry>
+        <material name="">
+          <color rgba="0.64706 0.61961 0.58824 1" />
+        </material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0.02" rpy="0 0 0" />
+        <geometry>
+          <cylinder length="0.02" radius="0.02" />
+        </geometry>
+      </collision>
+    </link>
+    <joint name="j_${prefix}_suck" type="revolute">
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <parent link="l_${prefix}_suck_pitch" />
+      <child link="l_${prefix}_suck" />
+      <axis xyz="0 0 1" />
+      <limit lower="${-pi}" upper="${pi}" effort="0.5" velocity="5" />
+    </joint>
+  </xacro:macro>
+
+  <xacro:macro name="left_leg" params="prefix y">
+    <link name="l_${prefix}_thigh">
+      <inertial>
+        <origin xyz="0.064045 -0.00074865 0.00088553" rpy="0 0 0" />
+        <mass value="0.503" />
+        <inertia ixx="0.00030812" ixy="-0.000008239" ixz="0.000020499" iyy="0.000459345" iyz="0.000000822" izz="0.000399273" />
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="../${mesh_type}_meshes/l_lf_thigh.STL" />
+        </geometry>
+        <material name="">
+          <color rgba="0.79216 0.81961 0.93333 1" />
+        </material>
+      </visual>
+      <collision>
+        <!-- 以下是比较贴合thigh关节外部轮廓的 -->
+        <!-- <origin xyz="0.072 0.002 0" rpy="1.57 0 0" />
+        <geometry>
+          <cylinder length="0.078" radius="0.032" />
+        </geometry> -->
+        <!-- 以下是和碰撞检查接近，采用球体近似的 -->
+        <origin xyz="0.072 0 0" rpy="0 0 0"/>
+        <geometry>
+          <sphere radius="0.045"/>
+        </geometry>      
+      </collision>
+    </link>
+    <joint name="j_${prefix}_thigh" type="revolute">
+      <origin xyz="-0.10 ${y} 0" rpy="0 0 3.14159265358979" />
+      <parent link="body" />
+      <child link="l_${prefix}_thigh" />
+      <axis xyz="0 0 1" />
+      <xacro:if value="${ prefix=='lm' }">
+        <limit lower="${-pi*2.0/9.0}" upper="${pi*2.0/9.0}" effort="27" velocity="5" />
+      </xacro:if>
+      <xacro:if value="${ prefix=='lf' }">
+        <limit lower="${-pi*19.0/36.0}" upper="${pi*5.0/18.0}" effort="27" velocity="5" />
+      </xacro:if>
+      <xacro:if value="${ prefix=='lb' }">
+        <limit lower="${-pi*5.0/18.0}" upper="${pi*19/36}" effort="27" velocity="5" />
+      </xacro:if>
+    </joint>
+
+    <link name="l_${prefix}_knee">
+      <inertial>
+        <origin xyz="0.065 8.3639E-13 0.025152" rpy="0 0 0" />
+        <mass value="0.11208" />
+        <inertia ixx="0.000080839" ixy="0" ixz="0" iyy="0.000370523" iyz="0" izz="0.00032306" />
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="../${mesh_type}_meshes/l_lf_knee.STL" />
+        </geometry>
+        <material name="">
+          <color rgba="0.89804 0.91765 0.92941 1" />
+        </material>
+      </visual>
+      <!-- <collision>
+        <origin xyz="0.065 0 0" rpy="0 0 0" />
+        <geometry>
+          <box size="0.06 0.04 0.08" />
+        </geometry>
+      </collision> -->
+    </link>
+    <joint name="j_${prefix}_knee" type="revolute">
+      <origin xyz="0.072 0 0" rpy="1.5707963267949 0 0" />
+      <parent link="l_${prefix}_thigh" />
+      <child link="l_${prefix}_knee" />
+      <axis xyz="0 0 1" />
+      <limit lower="${-pi*7.0/9.0}" upper="${pi*27.0/36.0}" effort="27" velocity="5" />
+    </joint>
+
+    <link name="l_${prefix}_ankle">
+      <inertial>
+        <origin xyz="0.027077 0.00014442 0.0030176" rpy="0 0 0" />
+        <mass value="0.568" />
+        <inertia ixx="0.000261169" ixy="0.000000856" ixz="-0.000085913" iyy="0.00167152" iyz="0.000000933" izz="0.001646969" />
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="../${mesh_type}_meshes/l_lf_ankle.STL" />
+        </geometry>
+        <material name="">
+          <color rgba="0.79216 0.81961 0.93333 1" />
+        </material>
+      </visual>
+      <collision>
+        <!-- 以下是比较贴合ankle关节外部轮廓的 -->
+        <!-- <origin xyz="0.06 0 0" rpy="0 0 0" />
+        <geometry>
+          <box size="0.165 0.06 0.08" />
+        </geometry> -->
+        <!-- 以下是和碰撞检查接近，采用球体近似的 -->
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <sphere radius="0.045"/>
+        </geometry>        
+      </collision>
+      
+    </link>
+    <joint name="j_${prefix}_ankle" type="revolute">
+      <origin xyz="0.13 0 0" rpy="0 0 0" />
+      <parent link="l_${prefix}_knee" />
+      <child link="l_${prefix}_ankle" />
+      <axis xyz="0 0 1" />
+      <limit lower="${-pi*5.0/6.0}" upper="${pi*11.0/12.0}" effort="27" velocity="5" />
+    </joint>
+
+    <link name="l_${prefix}_foot">
+      <inertial>
+        <origin xyz="0.00030471 4.9558E-10 0.00035688" rpy="0 0 0" />
+        <mass value="0.015" />
+        <inertia ixx="0.000001216" ixy="0" ixz="0.000000002" iyy="0.000000892" iyz="0" izz="0.000000428" />
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="../${mesh_type}_meshes/l_lf_foot.STL" />
+        </geometry>
+        <material name="">
+          <color rgba="0.65098 0.61961 0.58824 1" />
+        </material>
+      </visual>
+    </link>
+    <joint name="j_${prefix}_foot" type="revolute">
+      <origin xyz="0.17 0 0" rpy="0 0 0" />
+      <parent link="l_${prefix}_ankle" />
+      <child link="l_${prefix}_foot" />
+      <axis xyz="0 0 1" />
+      <limit lower="${-pi/2.0}" upper="${pi/2.0}" effort="0.45" velocity="${pi}" />
+    </joint>
+
+    <link name="l_${prefix}_suck_roll">
+      <inertial>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <mass value="0.001" />
+        <inertia ixx="0.0000001" ixy="0" ixz="0" iyy="0.0000001" iyz="0" izz="0.0000001" />
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <sphere radius="0.008" />
+        </geometry>
+        <material name="">
+          <color rgba="0.2 0.2 0.2 0.35" />
+        </material>
+      </visual>
+    </link>
+    <joint name="j_${prefix}_suck_roll" type="revolute">
+      <origin xyz="0.001 0 0" rpy="0 1.5707963267949 0" />
+      <parent link="l_${prefix}_foot" />
+      <child link="l_${prefix}_suck_roll" />
+      <axis xyz="1 0 0" />
+      <limit lower="${-pi/9.0}" upper="${pi/9.0}" effort="0.2" velocity="2" />
+    </joint>
+
+    <link name="l_${prefix}_suck_pitch">
+      <inertial>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <mass value="0.001" />
+        <inertia ixx="0.0000001" ixy="0" ixz="0" iyy="0.0000001" iyz="0" izz="0.0000001" />
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <sphere radius="0.008" />
+        </geometry>
+        <material name="">
+          <color rgba="0.2 0.2 0.2 0.35" />
+        </material>
+      </visual>
+    </link>
+    <joint name="j_${prefix}_suck_pitch" type="revolute">
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <parent link="l_${prefix}_suck_roll" />
+      <child link="l_${prefix}_suck_pitch" />
+      <axis xyz="0 1 0" />
+      <limit lower="${-pi/9.0}" upper="${pi/9.0}" effort="0.2" velocity="2" />
+    </joint>
+
+    <link name="l_${prefix}_suck">
+      <inertial>
+        <origin xyz="5.5511E-17 0 0.019468" rpy="0 0 0" />
+        <mass value="0.203" />
+        <inertia ixx="0.000028634" ixy="-0.000000001" ixz="0" iyy="0.000028269" iyz="0" izz="0.00004012" />
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="../${mesh_type}_meshes/l_lf_suck.STL" />
+        </geometry>
+        <material name="">
+          <color rgba="0.64706 0.61961 0.58824 1" />
+        </material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0.02" rpy="0 0 0" />
+        <geometry>
+          <cylinder length="0.02" radius="0.02" />
+        </geometry>
+      </collision>
+    </link>
+    <joint name="j_${prefix}_suck" type="revolute">
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <parent link="l_${prefix}_suck_pitch" />
+      <child link="l_${prefix}_suck" />
+      <axis xyz="0 0 1" />
+      <limit lower="${-pi}" upper="${pi}" effort="0.5" velocity="5" />
+    </joint>
+  </xacro:macro>
+
+  <xacro:right_leg prefix="rf" y="0.22" />
+  <xacro:right_leg prefix="rm" y="0" />
+  <xacro:right_leg prefix="rb" y="-0.22" />
+  <xacro:left_leg prefix="lf" y="0.22" /> 
+  <xacro:left_leg prefix="lm" y="0" />
+  <xacro:left_leg prefix="lb" y="-0.22" />
+
+
+  
+</robot>
