@@ -12,6 +12,7 @@ flat_index = ro.body_voxels.Pos2FlatIndex(np.array(
 print("esdf=",ro.body_voxels.esdf_flat_for_env[flat_index])
 from spatialmath import SE3,SO3
 import numpy as np
+
 # from pathlib import Path
 # from legged_gym import LEGGED_GYM_ROOT_DIR
 # import json

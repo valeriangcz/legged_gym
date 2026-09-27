@@ -679,13 +679,13 @@ if __name__ == "__main__":
     hex_state = HexState(Kinematic())
     # se3_initial_file = LEGGED_GYM_ROOT_DIR+"/legged_gym/expert_complex_utils/SE3_path/teleop_demo_20260707_221719.json"
     # se3_initial_file = LEGGED_GYM_ROOT_DIR+"/legged_gym/expert_complex_utils/SE3_path/teleop_demo_20260708_220712.json"
-    se3_initial_file = LEGGED_GYM_ROOT_DIR+"/legged_gym/expert_complex_utils/SE3_path/teleop_demo_20260808_113346.json"
+    se3_initial_file = LEGGED_GYM_ROOT_DIR+"/legged_gym/expert_complex_utils/SE3_path/teleop_demo_20260927_195801.json"
     post = PostProcess(se3_initial_file,hex_state,OptCfg())
     
-    post.ShortCutPath()
-    # post.se3_path_short.clear()
-    # for se3 in post.se3_path:
-    #     post.se3_path_short.append(se3)
+    # post.ShortCutPath()
+    post.se3_path_short.clear()
+    for se3 in post.se3_path:
+        post.se3_path_short.append(se3)
     post.GetCtrlPoes()
     out_dir = os.path.join(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path")
     json_file = os.path.join(out_dir,

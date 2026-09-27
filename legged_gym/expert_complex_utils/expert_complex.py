@@ -9,6 +9,7 @@ from .hex_utils import Kinematic
 from .env_robot_voxels import HexState,EnvPointsVoxels
 from scipy.interpolate import BSpline
 from scipy.optimize import minimize
+from pathlib import Path
 
 def se3_vee(Xi:np.ndarray):
     rho = Xi[:3,3]
@@ -32,7 +33,8 @@ class ExpertComplex:
         self.singularity_threshold = singularity_threshold
         self.singularity_legs = np.zeros((6,),dtype=np.bool_) #进入奇异点，设置为1
         self.hold_q = np.zeros((6,),dtype=np.float32) #记录第一次进入奇异点值对应的真实关节角
-        self.kin = Kinematic(singularity_threshold=self.singularity_threshold)
+        urdf_path = Path(__file__).resolve().parents[2] / "resources/robots/hex_magnetic/urdf/hex_all.urdf"
+        self.kin = Kinematic(singularity_threshold=self.singularity_threshold,urdf_path=urdf_path)
         # self.chs = RobotConvexHulls(singularity_threshold=self.singularity_threshold)
         self.hex_state = HexState(kinematic=self.kin)
 
@@ -41,8 +43,8 @@ class ExpertComplex:
         self.gaits = np.zeros((6,),dtype=np.bool_) #1表示stance 0表示swing
         self.last_gaits = self.gaits.copy()
         self.dt = 0.01 # s
-        self.v_max = 0.02 # m/s
-        self.w_max = 0.06 # rad/s
+        self.v_max = 0.03 # m/s
+        self.w_max = 0.08 # rad/s
         #stance 状态下最多移动的距离或者角度
         self._stance_maxmove_t = 0.1 #m
         self._stance_maxmove_w = 0.2 #rad
@@ -78,15 +80,14 @@ class ExpertComplex:
         self.contact_count = np.zeros(6,dtype=np.int32)
         #吸附状态
         self.adhesions = np.zeros(6,dtype=np.bool_)
-        self.max_adhesions_force = 300.0
+        self.max_adhesions_force = 200.0
         # 准静态支撑前馈：在机身 R 系中分配接触力，再映射到各腿局部 Jacobian。
-        self.total_mass = 14.530042
-        self.R_body_com = np.array([0.0014417,0.043319,0.0041358],dtype=np.float64)
+        self.total_mass = self.kin.total_mass
         self.world_gravity = np.array([0.0,0.0,-9.81],dtype=np.float64)
         self.motor_torque_limits = np.full((6,3),27.0,dtype=np.float64)
         self.tau_ff = np.zeros((6,3),dtype=np.float32)
         self.static_contact_forces_R = np.zeros((6,3),dtype=np.float32)
-        self._tau_ff_stance_mask = np.zeros(6,dtype=np.bool_)
+        self._tau_ff_support_mask = np.zeros(6,dtype=np.bool_)
         self._tau_ff_transition_start = np.zeros((6,3),dtype=np.float32)
         self._tau_ff_transition_steps = max(1,int(round(0.1/self.dt)))
         self._tau_ff_transition_remaining = 0
@@ -129,7 +130,7 @@ class ExpertComplex:
         self.B_support_n[2,:] = 1.0
         self.tau_ff.fill(0.0)
         self.static_contact_forces_R.fill(0.0)
-        self._tau_ff_stance_mask.fill(False)
+        self._tau_ff_support_mask.fill(False)
         self._tau_ff_transition_start.fill(0.0)
         self._tau_ff_transition_remaining = 0
         self.set_init = True
@@ -152,7 +153,7 @@ class ExpertComplex:
         #对每个支撑腿，选择一个最中心的落脚点
         point_map = self.hex_state.env_pointsmap_voxels
         B_init_points=[]
-        B_init_norms = []
+        # B_init_norms = []
         for i in range(6):
             if self.gaits[i]:
                 # 6,landing_num,2
@@ -167,9 +168,9 @@ class ExpertComplex:
                 #在腿部的voxels下点在体素的索引
                 leg_flat_idx=self.hex_state.robot_voxels.leg_voxels.Pos2FlatIndex(B_points)
                 best_in_leg_idx = np.argmax(self.hex_state.robot_voxels.to_bound_dist_flat[leg_flat_idx,i])
-                #为了避免初始状态就碰撞，设置距离落脚点原理平面2mm的位置
+                #为了避免初始状态就碰撞，设置距离落脚点原理平面1mm的位置 避免初始条件使机器人碰撞
                 self.B_landing_n[:,i] = B_norms[best_in_leg_idx]
-                B_init_points.append(B_points[best_in_leg_idx]+B_norms[best_in_leg_idx]*0.002)
+                B_init_points.append(B_points[best_in_leg_idx]+B_norms[best_in_leg_idx]*0.001)
             else:
                 B_init_points.append(np.array([0.18,0.0,0.0]))
         #N,3
@@ -183,7 +184,10 @@ class ExpertComplex:
             print("current pos\n",B_init_points)
             print("current branch\n",self.q3_branches)
             raise ValueError("Current pos and branch can not be solved")
-        return self.q_des,self.adhesions
+        fk_result = self.kin.ForwardKinAll(self.q_des)
+        self.B_e_cur[:] = fk_result["B_foot"].T
+        self._ComputeQuasiStaticTauFF(self.path_se3[0],self.q_des[:,:3],fk_result["R_com"])
+        return self.q_des,self.tau_ff,self.adhesions
         
 
 
@@ -192,7 +196,7 @@ class ExpertComplex:
 
     def RequestSingleStep(self, cur_se3:SE3,q_cur:np.ndarray,q_torque:np.ndarray,adhesion_force:np.ndarray)->Tuple[np.ndarray,np.ndarray,np.ndarray]:
         """
-        @input cur_se3当前的se3状态，q_cur6，3 电机驱动的关节角位置，q_torque 关节电机的扭矩 6，3
+        @input cur_se3当前的se3状态，q_cur6，4 主动关节角位置，q_torque 关节电机的扭矩 6，3
         adhesion_force 6 吸附力大小
         @output q_des (6,4), tau_ff (6,3), adhesions (6,)
         """
@@ -200,10 +204,12 @@ class ExpertComplex:
             raise ValueError("path_se3 is None, please use LoadSE3(path_se3) first")
         if not self.set_init:
             raise RuntimeError("Please set init state of robot first by SetInit(q_init)")
-        self.kin.ForwardKin(q_cur,self.B_e_cur.T)
-        self.GaitPlanning(cur_se3,q_cur,q_torque,adhesion_force) #更新步态，更新B_e_des_traj
-        self.GetJointAngles(q_cur)# 根据当前角度和期望执行的B_e_des计算目标角度
-        self._ComputeQuasiStaticTauFF(cur_se3,q_cur)
+        fk_result = self.kin.ForwardKinAll(q_cur)
+        q_motor = q_cur[:,:3]
+        self.B_e_cur[:] = fk_result["B_foot"].T
+        self.GaitPlanning(cur_se3,q_motor,q_torque,adhesion_force) #更新步态，更新B_e_des_traj
+        self.GetJointAngles(q_motor)# 根据当前角度和期望执行的B_e_des计算目标角度
+        self._ComputeQuasiStaticTauFF(cur_se3,q_motor,fk_result["R_com"])
         return self.q_des, self.tau_ff, self.adhesions
 
     @staticmethod
@@ -216,8 +222,8 @@ class ExpertComplex:
             [-y,x,0.0],
         ],dtype=np.float64)
 
-    def _ComputeQuasiStaticTauFF(self,cur_se3:SE3,q_cur:np.ndarray)->np.ndarray:
-        """计算并平滑当前 stance 腿的准静态关节前馈扭矩。
+    def _ComputeQuasiStaticTauFF(self,cur_se3:SE3,q_cur:np.ndarray,R_com:np.ndarray)->np.ndarray:
+        """计算并平滑当前实际支撑腿的准静态关节前馈扭矩。
 
         ``B_e_cur`` 和 ``Jacobian`` 都在各腿局部系；接触力分配在机身 R
         系完成。点坐标通过 ``_B2R`` 转换以包含腿根平移，但力仅经
@@ -226,49 +232,71 @@ class ExpertComplex:
         q_cur = np.asarray(q_cur,dtype=np.float64)
         if q_cur.shape != (6,3) or not np.isfinite(q_cur).all():
             raise ValueError("q_cur must be a finite array with shape (6, 3)")
+        R_com = np.asarray(R_com,dtype=np.float64)
+        if R_com.shape != (3,) or not np.isfinite(R_com).all():
+            raise ValueError("R_com must be a finite array with shape (3,)")
 
         target_tau = np.zeros((6,3),dtype=np.float64)
         forces_R = np.zeros((6,3),dtype=np.float64)
-        stance_indices = np.flatnonzero(self.gaits)
-        if stance_indices.size >= 3:
+        R_WR = np.asarray(cur_se3.R,dtype=np.float64).reshape(3,3)
+        gravity_R = R_WR.T@self.world_gravity
+        # ``gaits`` 表示规划上的 stance；只有同时处于吸附状态的腿才能
+        # 参与物理支撑力分配。释放命令发出后，旧腿立即转为摆动重力补偿。
+        support_mask = self.gaits & self.adhesions
+        swing_mask = ~support_mask
+        support_indices = np.flatnonzero(support_mask)
+        if support_indices.size >= 3:
             # _B2R 是点坐标变换：这里必须保留腿根平移以形成正确力臂。
             R_foot = self.kin._B2R(
-                self.B_e_cur[:,stance_indices],stance_indices
+                self.B_e_cur[:,support_indices],support_indices
             )
-            r_R = R_foot-self.R_body_com[:,None]
-            count = stance_indices.size
+            r_R = R_foot-R_com[:,None]
+            count = support_indices.size
             A = np.zeros((6,3*count),dtype=np.float64)
             for column in range(count):
                 A[:3,3*column:3*column+3] = np.eye(3)
                 A[3:,3*column:3*column+3] = self._Skew(r_R[:,column])
 
-            R_WR = np.asarray(cur_se3.R,dtype=np.float64).reshape(3,3)
-            gravity_R = R_WR.T@self.world_gravity
             b = np.concatenate((-self.total_mass*gravity_R,np.zeros(3)))
             if np.linalg.matrix_rank(A) == 6:
                 force_stack = A.T@np.linalg.pinv(A@A.T,rcond=1e-9)@b
                 residual = A@force_stack-b
                 if np.isfinite(force_stack).all() and np.linalg.norm(residual) <= 1e-6*max(1.0,np.linalg.norm(b)):
                     force_R = force_stack.reshape(count,3)
-                    forces_R[stance_indices] = force_R
+                    forces_R[support_indices] = force_R
                     # 力是向量：只做 R<->腿局部系旋转，不加入腿根平移。
                     force_leg = self.kin.RVectorToLeg(
-                        force_R.T,stance_indices
+                        force_R.T,support_indices
                     ).T
-                    jacobian = self.kin.Jacobian(q_cur[stance_indices])
-                    target_tau[stance_indices] = -np.einsum(
+                    jacobian = self.kin.Jacobian(q_cur[support_indices])
+                    target_tau[support_indices] = -np.einsum(
                         "nai,na->ni",jacobian,force_leg
                     )
+
+        # Swing legs receive a virtual foot force that cancels their own weight.
+        # The existing foot Jacobian is deliberately reused here; the full leg
+        # mass is treated as an equivalent point load at the foot.
+        swing_indices = np.flatnonzero(swing_mask)
+        if swing_indices.size:
+            gravity_leg = self.kin.RVectorToLeg(
+                np.repeat(gravity_R[:,None],swing_indices.size,axis=1),
+                swing_indices,
+            ).T
+            virtual_force_leg = -self.kin.leg_masses[swing_indices,None]*gravity_leg
+            swing_jacobian = self.kin.Jacobian(q_cur[swing_indices])
+            target_tau[swing_indices] = np.einsum(
+                "nai,na->ni",swing_jacobian,virtual_force_leg
+            )
 
         target_tau = np.clip(
             target_tau,-self.motor_torque_limits,self.motor_torque_limits
         ).astype(np.float32)
         self.static_contact_forces_R[:] = forces_R.astype(np.float32)
 
-        if not np.array_equal(self.gaits,self._tau_ff_stance_mask):
+        if not np.array_equal(support_mask,self._tau_ff_support_mask):
             self._tau_ff_transition_start[:] = self.tau_ff
             self._tau_ff_transition_remaining = self._tau_ff_transition_steps
-            self._tau_ff_stance_mask[:] = self.gaits
+            self._tau_ff_support_mask[:] = support_mask
         if self._tau_ff_transition_remaining > 0:
             completed = (
                 self._tau_ff_transition_steps-self._tau_ff_transition_remaining+1
@@ -695,15 +723,31 @@ class ExpertComplex:
         if self.path_se3 is None or len(self.path_se3) == 0:
             raise ValueError("path_se3 is empty, please LoadSE3(path_se3) first")
 
-        # cache path translations to avoid repeated extraction overhead
+        # Cache path poses to avoid repeated extraction overhead. A reference
+        # pose is close only when both its translation and orientation are
+        # close to the current base pose.
         if (not hasattr(self, "_path_positions")) or len(self._path_positions) != len(self.path_se3):
             self._path_positions = np.array([pose.t for pose in self.path_se3])
+            self._path_rotations = np.array([pose.R for pose in self.path_se3])
 
         cur_pos = np.asarray(cur_se3.t)
         diff = self._path_positions - cur_pos
-        dist_sq = np.einsum("ij,ij->i", diff, diff)
-        index = np.argmin(dist_sq)
-        index = np.minimum(index+1,len(self.path_se3)-1) #为了避免机器人往后退，尽量选择前面的目标作为轨迹
+        translation_distance = np.linalg.norm(diff,axis=1)
+
+        cur_rotation = np.asarray(cur_se3.R,dtype=np.float64).reshape(3,3)
+        relative_rotations = np.matmul(np.transpose(self._path_rotations,(0,2,1)),cur_rotation)
+        cos_angles = (np.trace(relative_rotations,axis1=1,axis2=2)-1.0)/2.0
+        rotation_distance = np.arccos(np.clip(cos_angles,-1.0,1.0))
+
+        # Translation (m) and rotation (rad) have different units. Convert
+        # both to their minimum execution time and use the slower component,
+        # consistent with _TimeDist().
+        se3_distance = np.maximum(
+            translation_distance/self.v_max,
+            rotation_distance/self.w_max,
+        )
+        index = np.argmin(se3_distance)
+        index = np.minimum(index,len(self.path_se3)-1) #为了避免机器人往后退，尽量选择前面的目标作为轨迹
         return index
     
     def _ContactDetection(self,q_cur,q_torque)->np.ndarray:
@@ -713,6 +757,7 @@ class ExpertComplex:
         # (6,3) * (6,3) -> 6
         contact_force = np.sum(self.kin.CF_Estimate(q_torque,q_cur,self.singularity_legs) * self.B_landing_n.T,axis=1)
         self.contact_count[(contact_force <=-7)&(~self.gaits)&(self.q_traj_index>self.B_e_traj_len/3.0)] += 1
+
         # print(f"contac_force={np.round(contact_force,2)} count={self.contact_count} gaits={self.gaits}")
         #接触力  & 执行超过一半轨迹（避免stance刚切换为swing时就判定接触导致摆动结束）
         # print(f" contact_force={contact_force} gaits={self.gaits}")
@@ -734,8 +779,7 @@ class ExpertComplex:
         # R_normals = self.B_landing_n[:,stance_index].copy().T #N,3
         R_normals = self.B_support_n[:,stance_index].copy().T #N,3
         R_normals[stance_index<3,:2] *= -1.0
-        #这里是原来保存了一个 array 为了循环方便放入 改成 list[array]
-        for i,index in enumerate(stance_index):
+        for index in stance_index:
             self.B_e_traj[index] = [self.B_e_traj[index]]
         #第一个点是起点，clearTraj时已经放入了，这里从第二个se3开始
         for se3 in path_se3[1:]:
@@ -755,6 +799,7 @@ class ExpertComplex:
                 break
 
         for i,index in enumerate(stance_index):
+            # print("B_e_traj[index]=",self.B_e_traj[index][:10])
             self.B_e_traj[index] = np.column_stack(self.B_e_traj[index])
         self.B_e_traj_len[self.gaits] = len(self.interp_path_se3)
     
@@ -764,8 +809,8 @@ class ExpertComplex:
         # self.interp_path_se3
         stance_index = self.gaits.nonzero()[0]
         self._ClearTraj(self.gaits)
-        for i,index in enumerate(stance_index):
-            self.B_e_traj[index] = [self.B_e_traj[index]]
+        # for i,index in enumerate(stance_index):
+        #     self.B_e_traj[index] = [self.B_e_traj[index]]
 
         # cur_follow_index = self.q_traj_index[self.gaits][0] #q_traj_index
         R_e = self.kin._B2R(self.B_e_cur[:,stance_index],stance_index)
@@ -870,7 +915,7 @@ class ExpertComplex:
         目前设定2s内完成摆动轨迹
         """
         if len(self.B_e_traj) != 6:
-            self.B_e_traj = [[self.B_e_cur[:,i].copy()] for i in range(6)]
+            self.B_e_traj = [self.B_e_cur[:,i,None].copy() for i in range(6)]
         self._ClearTraj(~self.gaits)
         swing_index = (~self.gaits).nonzero()[0]
         stance_index = self.gaits.nonzero()[0]
@@ -1234,8 +1279,12 @@ class ExpertComplex:
         future_path_se3,_ = self._Start2PathSE3Interp(target_se3)
         if not len(future_path_se3)>1:
             for leg_index in swing_index:
-                self.B_e_traj[leg_index] = np.column_stack(self.B_e_traj[leg_index])
-                self.B_e_traj_len[leg_index] = self.B_e_traj[leg_index].shape[1]
+                traj = self._QuinticInterp(self.B_e_cur[:,leg_index],np.zeros((3,)),np.zeros((3,)),
+                                            np.array([0.18,0,0]),np.zeros((3,)),np.zeros((3,)),
+                                            self._swing_t,
+                                            np.arange(0,self._swing_t,0.01))
+                self.B_e_traj[leg_index] = traj
+                self.B_e_traj_len[leg_index] = traj.shape[1]
             return
         stance_points = np.column_stack([self.B_e_traj[leg_index][:,-1] for leg_index in stance_index])
         stance_points = self.kin._B2R(stance_points,stance_index).T

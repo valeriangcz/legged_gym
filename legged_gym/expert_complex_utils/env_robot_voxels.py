@@ -292,7 +292,7 @@ class LegVoxels(Voxels):
         self.x_b3 = np.full((self.grid_size, max_sol, 3), np.nan, dtype=np.float32)
         # self.knee_pos = np.full((self.grid_size, max_sol, 3), np.nan, dtype=np.float32)
         self.ankle_pos = np.full((self.grid_size, max_sol, 3),np.nan, dtype=np.float32)
-        self.ankle_collide_radi = 0.04 #ankle关节碰撞圆的半径
+        self.ankle_collide_radi = 0.045 #ankle关节碰撞圆的半径
 
         #[LB:[0,1,2,3],LF:[3,4,5,6],[],[]]
         self._leg_names=["LB","LF","LM","RB","RF","RM"]
@@ -682,7 +682,7 @@ class HexState:
         R_normals = R_normals/np.maximum(np.linalg.norm(R_normals,axis=1,keepdims=True),eps)
         dot_res = np.sum(R_normals*pn,axis=1)
         #在连杆所在平面的角度锥之内 N,1
-        inside_plane_cone = (np.abs(dot_res) <= np.cos(np.deg2rad(75.0)))[:,None]
+        inside_plane_cone = (np.abs(dot_res) <= np.cos(np.deg2rad(70.0)))[:,None]
 
         #选择这一点对应的解的分支，采用x_b3的方向判断
         B_points = self.kin._R2B(R_points.T,leg_index) #3,N
@@ -1299,6 +1299,7 @@ class HexState:
         #检查法向量可行性
 
         norm_feasi_mask = self._LegNormFeasi(R_points,R_normals,leg_indices)[np.arange(R_points.shape[0]),sol_indices] #leg_size,2
+        # print("norm_feasi_mask=",norm_feasi_mask)
         if not norm_feasi_mask.all():
             return False
         #计算点所在的的体素索引
@@ -1319,6 +1320,9 @@ class HexState:
         ix,iy,iz = self.env_pointsmap_voxels.voxels.Pos2GridIndex(ankle_pos).T
         ankle_free_mask = (self.env_pointsmap_voxels.env_esdf[ix,iy,iz]>=
                            self.robot_voxels.leg_voxels.ankle_collide_radi)
+        # print("reachable_mask=",reachable_mask)
+        # print("ankle_free_mask=",ankle_free_mask)
+
         return (reachable_mask&ankle_free_mask).all()
         # return (inside_mask&ankle_free_mask).all()
 

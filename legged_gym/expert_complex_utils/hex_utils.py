@@ -5,11 +5,13 @@ import numpy as np
 from numpy import cos, sin, arccos, arctan2, arcsin, sqrt,pi
 from math import radians
 from typing import List, Tuple, Union
+from pathlib import Path
+import xml.etree.ElementTree as ET
 
 class Kinematic:
     def __init__(self,l1=0.072,l2=0.13,l3=0.17,
                  bx=0.1,by=0.22,
-                 singularity_threshold=0.02):
+                 singularity_threshold=0.02,urdf_path=None):
         self.l1=l1
         self.l2=l2
         self.l3=l3
@@ -48,6 +50,179 @@ class Kinematic:
             if 'B' in name:
                 by = -self._by
             self.leg_base_p[:,i]=[bx,by,0.0]        
+
+        self._mass_model = None
+        if urdf_path is not None:
+            self._LoadMassModel(urdf_path)
+
+    def _LoadMassModel(self,urdf_path):
+        """Load the mass model and validate the direct-FK URDF geometry once."""
+        urdf_path = Path(urdf_path)
+        if not urdf_path.is_file():
+            raise FileNotFoundError(f"URDF mass model does not exist: {urdf_path}")
+        root = ET.parse(urdf_path).getroot()
+        links = {link.get("name"):link for link in root.findall("link")}
+        joints = {joint.get("name"):joint for joint in root.findall("joint")}
+        link_order = ("thigh","knee","ankle","foot","ball1","ball2","suck","toe")
+
+        def inertial(link_name):
+            node = links[link_name].find("inertial")
+            if node is None:
+                return 0.0,np.zeros(3,dtype=np.float64)
+            mass = float(node.find("mass").get("value"))
+            origin = node.find("origin")
+            return mass,np.fromstring(origin.get("xyz","0 0 0"),sep=" ",dtype=np.float64)
+
+        expected_joints = {
+            "knee":("revolute",[0.072,0.0,0.0],[np.pi/2,0.0,0.0],[0.0,0.0,1.0]),
+            "ankle":("revolute",[0.13,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,1.0]),
+            "foot":("revolute",[0.17,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,1.0]),
+            "ball1":("revolute",[0.001,0.0,0.0],[0.0,np.pi/2,0.0],[1.0,0.0,0.0]),
+            "ball2":("revolute",[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,1.0,0.0]),
+            "suck":("revolute",[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,1.0]),
+            "toe":("fixed",[0.0,0.0,0.026],[0.0,0.0,0.0],None),
+        }
+
+        def validate_joint(prefix,part):
+            expected_type,expected_xyz,expected_rpy,expected_axis = expected_joints[part]
+            joint = joints.get(f"j_{prefix}_{part}")
+            if joint is None or joint.get("type") != expected_type:
+                raise ValueError(f"Unsupported direct-FK joint: j_{prefix}_{part}")
+            origin = joint.find("origin")
+            xyz = np.fromstring(origin.get("xyz","0 0 0"),sep=" ",dtype=np.float64)
+            rpy = np.fromstring(origin.get("rpy","0 0 0"),sep=" ",dtype=np.float64)
+            axis_node = joint.find("axis")
+            axis = None if axis_node is None else np.fromstring(axis_node.get("xyz"),sep=" ",dtype=np.float64)
+            if (
+                not np.allclose(xyz,expected_xyz,atol=1e-10)
+                or not np.allclose(rpy,expected_rpy,atol=1e-10)
+                or (expected_axis is None and axis is not None)
+                or (expected_axis is not None and (axis is None or not np.allclose(axis,expected_axis,atol=1e-10)))
+            ):
+                raise ValueError(f"Unsupported direct-FK geometry: j_{prefix}_{part}")
+
+        body_mass,body_com = inertial("body")
+        leg_models = []
+        for leg_name in self._leg_names:
+            prefix = leg_name.lower()
+            masses = []
+            coms = []
+            for link_part in link_order:
+                mass,com = inertial(f"l_{prefix}_{link_part}")
+                masses.append(mass)
+                coms.append(com)
+            hip = joints[f"j_{prefix}_thigh"]
+            hip_axis = np.fromstring(hip.find("axis").get("xyz"),sep=" ",dtype=np.float64)
+            if hip.get("type") != "revolute" or not np.allclose(hip_axis,[0.0,0.0,1.0],atol=1e-10):
+                raise ValueError(f"Unsupported direct-FK hip joint: j_{prefix}_thigh")
+            for part in expected_joints:
+                validate_joint(prefix,part)
+            leg_models.append({
+                "masses":np.asarray(masses,dtype=np.float64),
+                "coms":np.asarray(coms,dtype=np.float64),
+            })
+        total_mass = body_mass+sum(model["masses"].sum() for model in leg_models)
+        self._mass_model = {
+            "link_order":link_order,
+            "body_mass":body_mass,
+            "body_com_R":body_com,
+            "legs":leg_models,
+            "total_mass":total_mass,
+            "geometry":{"a1":0.072,"a2":0.13,"a3":0.17,"ball_offset":0.001,"toe_offset":0.026},
+        }
+        self.total_mass = total_mass
+        self.leg_masses = np.asarray(
+            [leg_model["masses"].sum() for leg_model in leg_models],
+            dtype=np.float64,
+        )
+
+    def ForwardKinAll(self,joints):
+        """Compute all mass-link COMs with a direct, batch analytic FK.
+
+        ``joints`` has shape ``(6, 4)`` in ``LB, LF, LM, RB, RF, RM`` order.
+        Only ``q1..q4`` are active; ball1, ball2 and suck are fixed at zero.
+        For a vector ``v``, let ``Zi(v)=Rz(qi)v``,
+        ``X(v)=Rx(pi/2)v=[x,-z,y]`` and ``Y(v)=Ry(pi/2)v=[z,y,-x]``.  With
+        ``a1=.072``, ``a2=.13``, ``a3=.17`` and ``d=.001``, the fourth-joint
+        chain is::
+
+            P(v) = Z1(a1*ex + X(Z2(a2*ex + Z3(a3*ex + Z4(v)))))
+
+        The link COMs are ``Z1(c_thigh)``,
+        ``Z1(a1*ex + X(Z2(c_knee)))``,
+        ``Z1(a1*ex + X(Z2(a2*ex + Z3(c_ankle))))``, ``P(c_foot)``,
+        ``P(d*ex)`` for ball1/ball2, ``P(d*ex + Y(c_suck))`` and
+        ``P((d+.026)*ex)`` for toe.  Thus all six legs are evaluated with
+        vector operations, without runtime homogeneous-matrix multiplication.
+
+        Returned ``B_foot`` and ``leg_com_B`` are in each leg B frame;
+        ``R_com`` is in body R.
+        """
+        if self._mass_model is None:
+            raise RuntimeError("ForwardKinAll requires Kinematic(..., urdf_path=...)" )
+        joints = np.asarray(joints,dtype=np.float64)
+        if joints.shape != (6,4) or not np.isfinite(joints).all():
+            raise ValueError("joints must be a finite array with shape (6, 4)")
+
+        model = self._mass_model
+        geometry = model["geometry"]
+        q1,q2,q3,q4 = joints.T
+        coms = np.asarray([leg_model["coms"] for leg_model in model["legs"]])
+        masses = np.asarray([leg_model["masses"] for leg_model in model["legs"]])
+        ex = np.array([1.0,0.0,0.0],dtype=np.float64)
+
+        def rotate_z(points,angles):
+            cosine = np.cos(angles)
+            sine = np.sin(angles)
+            return np.column_stack((
+                cosine*points[:,0]-sine*points[:,1],
+                sine*points[:,0]+cosine*points[:,1],
+                points[:,2],
+            ))
+
+        def rotate_x_90(points):
+            return np.column_stack((points[:,0],-points[:,2],points[:,1]))
+
+        def rotate_y_90(points):
+            return np.column_stack((points[:,2],points[:,1],-points[:,0]))
+
+        def point_after_foot(local_points):
+            after_q4 = rotate_z(local_points,q4)
+            after_q3 = rotate_z(geometry["a3"]*ex+after_q4,q3)
+            after_q2 = rotate_z(geometry["a2"]*ex+after_q3,q2)
+            return rotate_z(geometry["a1"]*ex+rotate_x_90(after_q2),q1)
+
+        p_thigh = rotate_z(coms[:,0],q1)
+        p_knee = rotate_z(
+            geometry["a1"]*ex+rotate_x_90(rotate_z(coms[:,1],q2)),q1
+        )
+        p_ankle = rotate_z(
+            geometry["a1"]*ex+rotate_x_90(
+                rotate_z(geometry["a2"]*ex+rotate_z(coms[:,2],q3),q2)
+            ),q1
+        )
+        p_foot = point_after_foot(coms[:,3])
+        ball_local = np.broadcast_to(geometry["ball_offset"]*ex,(6,3))
+        p_ball = point_after_foot(ball_local)
+        p_suck = point_after_foot(ball_local+rotate_y_90(coms[:,6]))
+        toe_local = np.broadcast_to(
+            (geometry["ball_offset"]+geometry["toe_offset"])*ex,(6,3)
+        )
+        p_toe = point_after_foot(toe_local)
+        link_com_B = np.stack(
+            (p_thigh,p_knee,p_ankle,p_foot,p_ball,p_ball,p_suck,p_toe),axis=1
+        )
+        B_foot = point_after_foot(np.zeros((6,3),dtype=np.float64))
+        leg_com_B = np.einsum("li,lij->lj",masses,link_com_B)/masses.sum(axis=1)[:,None]
+        leg_com_R = self._B2R(leg_com_B.T,np.arange(6)).T
+
+        weighted_com = model["body_mass"]*model["body_com_R"]
+        weighted_com += np.einsum("l,lj->j",self.leg_masses,leg_com_R)
+        return {
+            "B_foot":B_foot,
+            "leg_com_B":leg_com_B,
+            "R_com":weighted_com/model["total_mass"],
+        }
         
     def ForwardKinReturn(self,joints)->np.ndarray:
         """joints:(3,)

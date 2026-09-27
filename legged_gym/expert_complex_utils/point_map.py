@@ -57,7 +57,8 @@ class PointMap:
         source_scale: Optional[float] = None,
         surface_sample_spacing: float = 0.015, #对STL文件表面的采样间距，建议取比voxel_size更细一些
         sensor_pose_file: Optional[str] = None,
-        suction_to_foot_offset:float = 0.0385, #吸盘末端到足端的距离，用于偏移landing_point
+        # suction_to_foot_offset:float = 0.0385, #吸盘末端到足端的距离，用于偏移landing_point 适用于hex_v4
+        suction_to_foot_offset:float = 0.03, #吸盘末端到足端的距离，用于偏移landing_point 适用于hex_magnetic
         verbose: bool = False,
     ):
         self.target_file = target_file

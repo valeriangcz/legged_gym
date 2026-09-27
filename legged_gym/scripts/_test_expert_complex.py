@@ -53,20 +53,18 @@ def LoadFromTeletopFile(file:Path)->List[SE3]:
 #初始化点云
 #初始化机器人轨迹
 path_se3 = []
-for i in range(100):
-    path_se3.append(SE3(0.345,1.24,0.24+i*0.02))
+# for i in range(100):
+#     path_se3.append(SE3(0.345,1.24,0.24+i*0.02))
 #从.json文件中读取
-# path_file = Path(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path/initial_se3_path_20260808_113501.json")
-# LoadFromBezierFile(path_file)
-# path_file = Path(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path/teleop_demo_20260801_120504.json")
-path_file = Path(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path/teleop_demo_20260918_174113.json")
-path_se3 = LoadFromTeletopFile(path_file)
+path_file = Path(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path/initial_se3_path_20260927_195818.json")
+path_se3 = LoadFromBezierFile(path_file)
+# path_file = Path(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path/teleop_demo_20260927_194709.json")
+# path_se3 = LoadFromTeletopFile(path_file)
 #初始化攀爬专家
 expert_complex = ExpertComplex()
 expert_complex.LoadSE3(path_se3)
 # q_des,adhesions = expert_complex.SetInit(default_pos)
-q_init,adhesions = expert_complex.SetInitBySE3()
-tau_ff = np.zeros((6,3),dtype=np.float32)
+q_init,tau_ff,adhesions = expert_complex.SetInitBySE3()
 
 #初始化hex_climb环境
 env_cfg = HexClimbCfg()
@@ -101,9 +99,9 @@ env.reset()
 # default_pos = env.default_dof_pos[0].to("cpu").numpy().reshape(6,-1)[:,0:4]
 
 print("adhesions=",adhesions)
-for _ in range(10000):
+for _ in range(100):
     StepExpert(q_init,tau_ff,adhesions)
-    time.sleep(0.1)
+    # time.sleep(0.1)
 
 #在环境中绘制原始点云地图
 # DrawPoints(point_map.points)
@@ -117,22 +115,22 @@ groups_drawed = False
 last_stance_group_index = expert_complex.stance_group_index
 
 #记录扭矩信息
-torques = []
+# torques = []
 counts = 0
 #ros发布消息
+q_des = q_init
 while not env.gym.query_viewer_has_closed(env.viewer):
     _,_,_reward,_reset,_extra = StepExpert(q_des,tau_ff,adhesions)
-    if counts >= 100*30:
-        np.savez("/home/val/BIH_ws/legged_gym/logs/torques_data.npz",np.array(torques))
-        print("save torques_data to file torques_data.npz")
-        break
-    counts += 1
+    # if counts >= 100*30:
+    #     np.savez("/home/val/BIH_ws/legged_gym/logs/torques_data.npz",np.array(torques))
+    #     print("save torques_data to file torques_data.npz")
+    #     break
+    # counts += 1
 
     if _reset:
         print("reset robot and SetInit")
         # q_des,adhesions = expert_complex.SetInit(default_pos)
-        q_des,adhesions = expert_complex.SetInitBySE3()
-        tau_ff.fill(0.0)
+        q_des,tau_ff,adhesions = expert_complex.SetInitBySE3()
         #先按照默认关节开始仿真一段时间等待稳定
         for _ in range(100):
             StepExpert(q_des,tau_ff,adhesions)
@@ -143,14 +141,13 @@ while not env.gym.query_viewer_has_closed(env.viewer):
         # np.set_printoptions(precision=2, suppress=True)
         # print(f"dof_pos = {env.dof_pos[0].numpy()}")
         cur_se3 = SE3.Rt(UnitQuaternion(s=_base_quat[3],v=_base_quat[:3]).R,_base_pos)
-        q_cur = env.dof_pos[0,env.dof_motor_drive_indices].to("cpu").numpy().reshape(6,3)
+        q_cur = env.dof_pos[0,env.dof_drive_indices].to("cpu").numpy().reshape(6,4)
         q_torque = env.torques[0,env.dof_motor_drive_indices].to("cpu").numpy().reshape(6,3)
         # adhesion_force = abs(env.rb_forces[0,env.feet_indices,2].to("cpu").numpy())
         adhesion_force = abs(env.rb_forces[0,env.magnetic_indices,2].reshape(6,3).sum(dim=1).to("cpu").numpy())
         contact_force = abs(env.contact_forces[0,env.feet_indices,2].to("cpu").numpy())
         # print(f"real contact force=",contact_force)
-        # print("torques\n",q_torque)
-        torques.append(q_torque)
+        # torques.append(q_torque)
         
         #请求专家轨迹
         q_des,tau_ff,adhesions = expert_complex.RequestSingleStep(

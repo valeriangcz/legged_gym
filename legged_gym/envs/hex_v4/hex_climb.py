@@ -76,6 +76,8 @@ class HexClimb(LeggedRobot):
 
         #每0.02s计算一次吸附力
         self.rb_forces = self._compute_adhesions(self.actions)
+        #为了适应不同机器人定义的z轴方向的不同，确保始终朝向吸附面的位置
+        rb_forces = -self.rb_forces
 
         for _ in range(self.cfg.control.decimation):
             self.torques = self._compute_torques(self.actions,q_des=q_des,tau_ff=tau_ff)
@@ -84,7 +86,7 @@ class HexClimb(LeggedRobot):
             
             self.gym.set_dof_actuation_force_tensor(self.sim,gymtorch.unwrap_tensor(self.torques))
             self.gym.apply_rigid_body_force_at_pos_tensors(self.sim,
-                                                gymtorch.unwrap_tensor(self.rb_forces),
+                                                gymtorch.unwrap_tensor(rb_forces),
                                                 gymtorch.unwrap_tensor(self.pos_rb_forces),
                                                 gymapi.LOCAL_SPACE)
             self.gym.simulate(self.sim)
@@ -141,11 +143,9 @@ class HexClimb(LeggedRobot):
         self.time_out_buf = self.episode_length_buf > self.max_episode_length
         
         self.reset_buf = (reset_collide | reset_contact | self.time_out_buf) & initial_condition
-
         #测试用
         if self.reset_buf.any():
             print(f"reset because reset_collide={reset_collide}, reset_contact={reset_contact}, timeout={self.time_out_buf}")
-        # self.reset_buf = reset_collide | self.time_out_buf
     
     def compute_observations(self):
         self.obs_buf = torch.cat((
@@ -268,7 +268,7 @@ class HexClimb(LeggedRobot):
         self.rb_forces = torch.zeros_like(self.contact_forces) #用于给足端施加吸力
         self.pos_rb_forces = torch.zeros_like(self.contact_forces) #指定给足施加吸附力的位置
         env_indices = torch.arange(self.num_envs,dtype=torch.long,device=self.device).unsqueeze(1)
-        self.pos_rb_forces[env_indices,self.magnetic_indices[:,0].unsqueeze(0),:] = torch.tensor([0,0.02,-0.009],device=self.device,dtype=torch.float)
+        self.pos_rb_forces[env_indices,self.magnetic_indices[:,0].unsqueeze(0),:] = torch.tensor([0,0.02,0.009],device=self.device,dtype=torch.float)
         self.pos_rb_forces[env_indices,self.magnetic_indices[:,1].unsqueeze(1),:] = torch.tensor([0.02 * 3**0.5,-0.01,0],device=self.device,dtype=torch.float)
         self.pos_rb_forces[env_indices,self.magnetic_indices[:,2].unsqueeze(1),:] = torch.tensor([-0.02 * 3**0.5,-0.01,0],device=self.device,dtype=torch.float)
         self.dof_pos_des = torch.zeros_like(self.dof_pos) #这里是关节期望的角度，包含了被动关节，其期望值一直为0
@@ -452,6 +452,7 @@ class HexClimb(LeggedRobot):
         pos_err = self.dof_pos_des-self.dof_pos
         vel_err = -self.dof_vel
         torques = self.actuator.get_torques(pos_err,vel_err)
+
         if tau_ff is not None:
             torques = torques.clone()
             torques[:,self.dof_motor_drive_indices] += tau_ff
@@ -489,7 +490,8 @@ class HexClimb(LeggedRobot):
         self.rb_forces[:,magnetic_indices,2] += adhesions_repeated*(self.cfg.control.suction_force_delt/3.0)
         self.rb_forces[:,magnetic_indices,2] *= contacts_filt_repeated.float()
         self.rb_forces = torch.clip(self.rb_forces,-self.cfg.control.suction_force_max/3.0,0.0)
-        print("robot contact force norm=",torch.norm(self.contact_forces[:,self.feet_indices,:],dim=-1))
+
+        # print("robot contact force norm=",torch.norm(self.contact_forces[:,self.feet_indices,:],dim=-1))
         # print("rb_forces \n ",self.rb_forces[:,magnetic_indices,2].reshape(6,3))
         return self.rb_forces
     

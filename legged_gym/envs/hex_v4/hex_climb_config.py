@@ -38,8 +38,8 @@ class HexClimbCfg(LeggedRobotCfg):
         #                 "slope":-0.5,
         #                 "platform_size":2}        
         slope_treshold=0.8
-        static_friction = 0.5
-        dynamic_friction = 0.4
+        static_friction = 0.35
+        dynamic_friction = 0.32
 
         stl_files = os.path.join(LEGGED_GYM_ROOT_DIR,"resources/environments/sutructure1/complex_surface.STL")
 
@@ -90,7 +90,7 @@ class HexClimbCfg(LeggedRobotCfg):
                     _joint = 0.0
                 default_joint_angles['j_'+t+'_' + qn]=_joint
         #缓冲时间 ，在设定时间不会检查终止条件，同时直接给adhesion的足端设定最大吸附力
-        buffer_time = 10.0 #s
+        buffer_time = 0.5 #s
     class control(LeggedRobotCfg.control):
         use_actuator_net = False
         # use_actuator_net = True
@@ -116,15 +116,18 @@ class HexClimbCfg(LeggedRobotCfg):
                     damping['j_'+t+'_'+qn] = 0.1                  
         action_scale=1.2
         decimation = 4
-        suction_force_delt=5 #每0.01s，释放时减少的力，吸附时吸力变化是其5倍
-        suction_force_max=300.0 #300N是最电磁铁大吸附力
+        suction_force_delt=20 #每0.01s，释放时减少的力，吸附时吸力变化是其5倍
+        suction_force_max=200.0 #300N是最电磁铁大吸附力
 
     class asset(LeggedRobotCfg.asset):
-        file=f"{LEGGED_GYM_ROOT_DIR}/resources/robots/hex_v4/urdf/hex_climb.urdf"
+        # file=f"{LEGGED_GYM_ROOT_DIR}/resources/robots/hex_v4/urdf/hex_climb.urdf"
+        file=f"{LEGGED_GYM_ROOT_DIR}/resources/robots/hex_magnetic/urdf/hex_all.urdf"
+        flip_visual_attachments = False
+
         name="hex_v4"
         foot_name="toe"
         penalize_contacts_on=["ankle","knee","thigh"]
-        terminate_after_contacts_on=["body"]
+        terminate_after_contacts_on=[]
 
         #额外增加两个，一个是电机驱动的关节名称，一个是电机和舵机驱动的关节名称
         dof_motor_drive=["thigh","knee","ankle"]
@@ -154,7 +157,7 @@ class HexClimbCfg(LeggedRobotCfg):
     class domain_rand(LeggedRobotCfg.domain_rand):
         push_robots=False
         randomize_friction = True
-        friction_range = [0.4,0.5]
+        friction_range = [0.325,0.33]
         # randomize_base_mass = True
         # added_mass_range = [-1., 1.]
 

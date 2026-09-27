@@ -9,7 +9,7 @@
     <inertial>
       <origin xyz="-0.00031149 -7.4441E-05 0.0027279" rpy="0 0 0" />
       <mass value="6.023" />
-      <inertia ixx="0.169108146" ixy="-0.000168229" ixz="0.000016567" iyy="0.040037856" iyz="-0.001521188" izz="0.2016899" />
+      <inertia ixx="0.169108146" ixy="-0.000168229" ixz="0.000016567" iyy="0.0260037856" iyz="-0.001521188" izz="0.2016899" />
     </inertial>
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
@@ -53,7 +53,7 @@
         <!-- 以下是和碰撞检查接近，采用球体近似的 -->
         <origin xyz="0.072 0 0" rpy="0 0 0"/>
         <geometry>
-          <sphere radius="0.045"/>
+          <sphere radius="0.0265"/>
         </geometry>      
       </collision>
     </link>
@@ -93,7 +93,7 @@
       <!-- <collision>
         <origin xyz="0.065 0 0" rpy="0 0 0" />
         <geometry>
-          <box size="0.06 0.04 0.08" />
+          <box size="0.06 0.026 0.08" />
         </geometry>
       </collision> -->
     </link>
@@ -129,7 +129,7 @@
         <!-- 以下是和碰撞检查接近，采用球体近似的 -->
         <origin xyz="0 0 0" rpy="0 0 0"/>
         <geometry>
-          <sphere radius="0.045"/>
+          <sphere radius="0.0265"/>
         </geometry>
       </collision>
     </link>
@@ -171,7 +171,7 @@
       <limit lower="${-pi/2.0}" upper="${pi/2.0}" effort="0.45" velocity="${pi}" />
     </joint>
 
-    <link name="l_${prefix}_suck_roll">
+    <link name="l_${prefix}_ball1">
       <inertial>
         <origin xyz="0 0 0" rpy="0 0 0" />
         <mass value="0.001" />
@@ -187,15 +187,15 @@
         </material>
       </visual>
     </link>
-    <joint name="j_${prefix}_suck_roll" type="revolute">
+    <joint name="j_${prefix}_ball1" type="revolute">
       <origin xyz="0.001 0 0" rpy="0 1.5707963267949 0" />
       <parent link="l_${prefix}_foot" />
-      <child link="l_${prefix}_suck_roll" />
+      <child link="l_${prefix}_ball1" />
       <axis xyz="1 0 0" />
       <limit lower="${-pi/9.0}" upper="${pi/9.0}" effort="0.2" velocity="2" />
     </joint>
 
-    <link name="l_${prefix}_suck_pitch">
+    <link name="l_${prefix}_ball2">
       <inertial>
         <origin xyz="0 0 0" rpy="0 0 0" />
         <mass value="0.001" />
@@ -211,10 +211,10 @@
         </material>
       </visual>
     </link>
-    <joint name="j_${prefix}_suck_pitch" type="revolute">
+    <joint name="j_${prefix}_ball2" type="revolute">
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <parent link="l_${prefix}_suck_roll" />
-      <child link="l_${prefix}_suck_pitch" />
+      <parent link="l_${prefix}_ball1" />
+      <child link="l_${prefix}_ball2" />
       <axis xyz="0 1 0" />
       <limit lower="${-pi/9.0}" upper="${pi/9.0}" effort="0.2" velocity="2" />
     </joint>
@@ -235,18 +235,47 @@
         </material>
       </visual>
       <collision>
-        <origin xyz="0 0 0.02" rpy="0 0 0" />
+        <origin xyz="0 0 0.014" rpy="0 0 0" />
         <geometry>
-          <cylinder length="0.02" radius="0.02" />
+          <cylinder length="0.012" radius="0.02" />
         </geometry>
       </collision>
     </link>
     <joint name="j_${prefix}_suck" type="revolute">
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <parent link="l_${prefix}_suck_pitch" />
+      <parent link="l_${prefix}_ball2" />
       <child link="l_${prefix}_suck" />
       <axis xyz="0 0 1" />
       <limit lower="${-pi}" upper="${pi}" effort="0.5" velocity="5" />
+    </joint>
+      <!-- 添加toe是为了检测吸附面是否接触碰撞 避免电磁铁侧面碰撞也误认为是吸附面接触 toe比suck小一点 且只有在suck底面露出来一点 -->
+    <link name="l_${prefix}_toe">
+      <inertial>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <mass value="1e-2"/>
+        <inertia ixx="1.053e-6" ixy="0" ixz="0" iyy="1.053e-6" iyz="0" izz="2.0e-6" />
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry> <cylinder radius="0.018" length="0.008" /> </geometry>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry> <cylinder radius="0.018" length="0.008" /> </geometry>
+      </collision>
+    </link>
+
+    <joint name="j_${prefix}_toe" type="fixed">
+      <origin xyz="0 0 0.026" rpy="0 0 0"/>
+      <parent link="l_${prefix}_suck"/>
+      <child link="l_${prefix}_toe"/>
+    </joint>
+    <!-- 添加 empty 是为了方便吸附力的施加 给suck toe  empy三个位置按照圆心分别设置三个正向力 能更好的模拟吸盘对额外力和扭矩的反应-->
+    <link name="l_${prefix}_empty"/>
+    <joint name="j_${prefix}_empty" type="fixed">
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <parent link="l_${prefix}_toe"/>
+      <child link="l_${prefix}_empty"/>
     </joint>
   </xacro:macro>
 
@@ -275,7 +304,7 @@
         <!-- 以下是和碰撞检查接近，采用球体近似的 -->
         <origin xyz="0.072 0 0" rpy="0 0 0"/>
         <geometry>
-          <sphere radius="0.045"/>
+          <sphere radius="0.0265"/>
         </geometry>      
       </collision>
     </link>
@@ -313,7 +342,7 @@
       <!-- <collision>
         <origin xyz="0.065 0 0" rpy="0 0 0" />
         <geometry>
-          <box size="0.06 0.04 0.08" />
+          <box size="0.06 0.026 0.08" />
         </geometry>
       </collision> -->
     </link>
@@ -349,7 +378,7 @@
         <!-- 以下是和碰撞检查接近，采用球体近似的 -->
         <origin xyz="0 0 0" rpy="0 0 0"/>
         <geometry>
-          <sphere radius="0.045"/>
+          <sphere radius="0.0265"/>
         </geometry>        
       </collision>
       
@@ -386,7 +415,7 @@
       <limit lower="${-pi/2.0}" upper="${pi/2.0}" effort="0.45" velocity="${pi}" />
     </joint>
 
-    <link name="l_${prefix}_suck_roll">
+    <link name="l_${prefix}_ball1">
       <inertial>
         <origin xyz="0 0 0" rpy="0 0 0" />
         <mass value="0.001" />
@@ -402,15 +431,15 @@
         </material>
       </visual>
     </link>
-    <joint name="j_${prefix}_suck_roll" type="revolute">
+    <joint name="j_${prefix}_ball1" type="revolute">
       <origin xyz="0.001 0 0" rpy="0 1.5707963267949 0" />
       <parent link="l_${prefix}_foot" />
-      <child link="l_${prefix}_suck_roll" />
+      <child link="l_${prefix}_ball1" />
       <axis xyz="1 0 0" />
       <limit lower="${-pi/9.0}" upper="${pi/9.0}" effort="0.2" velocity="2" />
     </joint>
 
-    <link name="l_${prefix}_suck_pitch">
+    <link name="l_${prefix}_ball2">
       <inertial>
         <origin xyz="0 0 0" rpy="0 0 0" />
         <mass value="0.001" />
@@ -426,10 +455,10 @@
         </material>
       </visual>
     </link>
-    <joint name="j_${prefix}_suck_pitch" type="revolute">
+    <joint name="j_${prefix}_ball2" type="revolute">
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <parent link="l_${prefix}_suck_roll" />
-      <child link="l_${prefix}_suck_pitch" />
+      <parent link="l_${prefix}_ball1" />
+      <child link="l_${prefix}_ball2" />
       <axis xyz="0 1 0" />
       <limit lower="${-pi/9.0}" upper="${pi/9.0}" effort="0.2" velocity="2" />
     </joint>
@@ -450,19 +479,48 @@
         </material>
       </visual>
       <collision>
-        <origin xyz="0 0 0.02" rpy="0 0 0" />
+        <origin xyz="0 0 0.014" rpy="0 0 0" />
         <geometry>
-          <cylinder length="0.02" radius="0.02" />
+          <cylinder length="0.012" radius="0.02" />
         </geometry>
       </collision>
     </link>
     <joint name="j_${prefix}_suck" type="revolute">
       <origin xyz="0 0 0" rpy="0 0 0" />
-      <parent link="l_${prefix}_suck_pitch" />
+      <parent link="l_${prefix}_ball2" />
       <child link="l_${prefix}_suck" />
       <axis xyz="0 0 1" />
       <limit lower="${-pi}" upper="${pi}" effort="0.5" velocity="5" />
     </joint>
+      <!-- 添加toe是为了检测吸附面是否接触碰撞 避免电磁铁侧面碰撞也误认为是吸附面接触 toe比suck小一点 且只有在suck底面露出来一点 -->
+    <link name="l_${prefix}_toe">
+      <inertial>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <mass value="1e-2"/>
+        <inertia ixx="1.053e-6" ixy="0" ixz="0" iyy="1.053e-6" iyz="0" izz="2.0e-6" />
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry> <cylinder radius="0.018" length="0.008" /> </geometry>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry> <cylinder radius="0.018" length="0.008" /> </geometry>
+      </collision>
+    </link>
+
+    <joint name="j_${prefix}_toe" type="fixed">
+      <origin xyz="0 0 0.026" rpy="0 0 0"/>
+      <parent link="l_${prefix}_suck"/>
+      <child link="l_${prefix}_toe"/>
+    </joint>
+    <!-- 添加 empty 是为了方便吸附力的施加 给suck toe  empy三个位置按照圆心分别设置三个正向力 能更好的模拟吸盘对额外力和扭矩的反应-->
+    <link name="l_${prefix}_empty"/>
+    <joint name="j_${prefix}_empty" type="fixed">
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <parent link="l_${prefix}_toe"/>
+      <child link="l_${prefix}_empty"/>
+    </joint>    
   </xacro:macro>
 
   <xacro:right_leg prefix="rf" y="0.22" />
