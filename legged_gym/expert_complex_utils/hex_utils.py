@@ -24,7 +24,7 @@ class Kinematic:
         # 这里保存每条腿thigh关节的
         self.joints_limits_thigh = np.zeros((6,2),dtype=np.float32)
         self.joints_limits_rest = np.array(
-            [[radians(-120),radians(125)],[radians(-155),radians(140)]],
+            [[radians(-140),radians(135)],[radians(-150),radians(165)]],
             dtype=np.float32,
         )
         #机器人身体的参数，腿部基坐标在R系下基座的位置
@@ -33,11 +33,11 @@ class Kinematic:
         self._leg_names=["LB","LF","LM","RB","RF","RM"]
         for i,name in enumerate(self._leg_names):
             if name=="LF" or name =="RB":
-                self.joints_limits_thigh[i]=[radians(-92),radians(45)]
+                self.joints_limits_thigh[i]=[radians(-92),radians(40)]
             elif name=="RF" or name=="LB":
-                self.joints_limits_thigh[i]=[radians(-45),radians(92)]
+                self.joints_limits_thigh[i]=[radians(-40),radians(92)]
             else:
-                self.joints_limits_thigh[i]=[radians(-45),radians(45)]
+                self.joints_limits_thigh[i]=[radians(-40),radians(40)]
         self.leg_base_p = np.zeros((3,6),dtype=np.float32)
         for i,name in enumerate(self._leg_names):
             #保存腿部基坐标原点在身体坐标系下的位置

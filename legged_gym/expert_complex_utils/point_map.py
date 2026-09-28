@@ -47,7 +47,7 @@ class PointMap:
         self,
         target_file: str,
         voxel_size: float = 0.04, #降采样后的点的平均间隔
-        suction_diameter: float = 0.05, #吸盘直径
+        suction_diameter: float = 0.04, #吸盘直径
         normal_radius: float = 0.08, #
         coverage_threshold: float = 0.85,
         plane_error_threshold: float = 0.01,
@@ -1066,7 +1066,7 @@ if __name__=='__main__':
         # "/home/sharpa/valerian_ws/legged_gym/resources/environments/sutructure1/complex_surface.STL",
         # "/home/sharpa/valerian_ws/legged_gym/resources/environments/sutructure1/complex_surface_point_map.npz",
         # LEGGED_GYM_ROOT_DIR+"/resources/environments/sutructure1/complex_surface.STL",
-        LEGGED_GYM_ROOT_DIR+"/resources/environments/structure2/regular_dodecagon.STL",
+        LEGGED_GYM_ROOT_DIR+"/resources/environments/structure2/complex_surface3.STL",
         # "/home/val/BIH_ws/legged_gym/resources/environments/sutructure1/complex_surface_point_map.npz",
         verbose=True,
     )

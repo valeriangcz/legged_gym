@@ -56,7 +56,6 @@ class KeyboardPoseLabeler:
         self,
         hex_state: HexState,
         init_pose: SE3 | None = None,
-        env_stride: int = 4,
         landing_stride: int = 2,
         output_dir: str | None = None,
     ):
@@ -68,9 +67,14 @@ class KeyboardPoseLabeler:
             # self.state.W_T_R = np.asarray(init_pose, dtype=np.float64).copy()
             self.state.W_T_R = init_pose.copy()
 
-        self.env_stride = max(1, int(env_stride))
         self.landing_stride = max(1, int(landing_stride))
         self.output_dir = output_dir or os.path.join(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path")
+
+        # 手动修改此路径以切换标注时显示的环境 STL；它必须与 pointmap 使用相同坐标系和单位。
+        self.environment_stl_path = os.path.join(
+            LEGGED_GYM_ROOT_DIR,
+            "resources/environments/structure2/complex_surface3.STL",
+        )
 
         self.vis: o3d.visualization.VisualizerWithKeyCallback | None = None
         self.body_surface_points_R = self._body_surface_points_R()
@@ -82,10 +86,7 @@ class KeyboardPoseLabeler:
         ]
         self.frame_mesh: o3d.geometry.TriangleMesh | None = None
         self.saved_frame_meshes: list[o3d.geometry.TriangleMesh] = []
-        self.env_cloud = self._make_point_cloud(
-            self.pointmap.points[:: self.env_stride],
-            [0.72, 0.72, 0.72],
-        )
+        self.env_mesh = self._load_environment_mesh()
         self.query_highlight_cloud = self._make_point_cloud(
             np.zeros((0, 3)),
             QUERY_ORANGE,
@@ -106,8 +107,8 @@ class KeyboardPoseLabeler:
         self.vis = o3d.visualization.VisualizerWithKeyCallback()
         self.vis.create_window("Keyboard Pose Labeler", width=1280, height=820)
 
-        # 静态点云只添加一次；动态几何在按键回调中原地更新。
-        self.vis.add_geometry(self.env_cloud)
+        # 静态环境网格和点云只添加一次；动态几何在按键回调中原地更新。
+        self.vis.add_geometry(self.env_mesh)
         self.vis.add_geometry(self.landing_cloud)
         self.vis.add_geometry(self.query_highlight_cloud)
         for cloud in self.feasible_landing_clouds:
@@ -175,7 +176,7 @@ class KeyboardPoseLabeler:
         within_mask = np.linalg.norm(robot_voxels.leg_voxels.center,axis=1)<=0.3
         #grid_size,6
         # inside_mask = robot_voxels.to_bound_dist_flat >= 0.0
-        inside_mask = robot_voxels.to_bound_dist_flat >= 0.042
+        inside_mask = robot_voxels.to_bound_dist_flat >= 0.04
         leg_points_R = []
         for leg_index in range(6):
             reachable = robot_voxels.robot_reachable_legs[..., leg_index].any(axis=1)
@@ -196,6 +197,22 @@ class KeyboardPoseLabeler:
         cloud.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
         cloud.paint_uniform_color(color)
         return cloud
+
+    def _load_environment_mesh(self) -> o3d.geometry.TriangleMesh:
+        """读取手动指定的环境 STL，并创建用于显示的浅灰色网格。"""
+        if not os.path.isfile(self.environment_stl_path):
+            raise FileNotFoundError(
+                f"environment STL file does not exist: {self.environment_stl_path}"
+            )
+
+        mesh = o3d.io.read_triangle_mesh(self.environment_stl_path)
+        if mesh.is_empty() or len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
+            raise ValueError(
+                f"failed to load a valid triangle mesh from STL: {self.environment_stl_path}"
+            )
+        mesh.compute_vertex_normals()
+        mesh.paint_uniform_color([0.72, 0.72, 0.72])
+        return mesh
 
     def _transform_points_R_to_W(self, points_R: np.ndarray) -> np.ndarray:
         """把 R 系点云批量转换到 W 系。"""

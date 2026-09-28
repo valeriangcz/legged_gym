@@ -43,14 +43,15 @@ class ExpertComplex:
         self.gaits = np.zeros((6,),dtype=np.bool_) #1表示stance 0表示swing
         self.last_gaits = self.gaits.copy()
         self.dt = 0.01 # s
-        self.v_max = 0.03 # m/s
-        self.w_max = 0.08 # rad/s
+        self.v_max = 0.08 # m/s
+        self.w_max = 0.2 # rad/s
         #stance 状态下最多移动的距离或者角度
-        self._stance_maxmove_t = 0.1 #m
-        self._stance_maxmove_w = 0.2 #rad
+        self._stance_maxmove_t = 0.2 #m
+        self._stance_maxmove_w = 0.4 #rad
         self.path_se3 = None #外界输入的参考轨迹
         self.follow_path_index = 0
-        self.interp_path_se3 = [] #根据当前位置插值计算的轨迹，与当前stance轨迹长度相同，与索引对应
+        self.interp_path_se3:List = [] #根据当前位置插值计算的轨迹，与当前stance轨迹长度相同，与索引对应
+        self.interp_path_T: List|np.array = [] #放入N*4*4的interp_path_se3，便于_Cal_Cost的时候批量计算
         self.set_init = False
         #三角步态分组
         self.groups = [[0,1,5],[2,3,4]]
@@ -58,7 +59,7 @@ class ExpertComplex:
         self.stance_group_index = 0
         self.gaits[self.groups[self.stance_group_index]]=1
         self.last_gaits = self.gaits.copy()
-        self._swing_t = 3.0
+        self._swing_t = 1.2
         #关节位置
         self.q_des = np.zeros((6,4),dtype=np.float32)
         self.q_traj_index = np.array([0]*6) #每条腿当前执行到的足端轨迹索引
@@ -71,7 +72,7 @@ class ExpertComplex:
         self.B_e_traj=[] #[np.ndarray(3,N),np.ndarray(3,M),...] 按照leg_names顺序
         self.B_e_traj_len = np.zeros(6,dtype=np.int32)
         self.landing_point = np.zeros((3,6)) #保存在B系下的表达
-        self.W_landing_points = np.zeros((3,6)) #保存在W系下的表达
+        self.W_landing_points = np.zeros((3,6)) #保存在W系下的表达 便于可视化
         self.B_landing_n = np.zeros((3,6)) #保存在B系下的表达 保存在B系下的表达 当前支撑/落脚点的法向量
         self.B_support_n = np.zeros((3,6))
         self.B_landing_n[2,:] = 1.0 #初始化为身体z轴方向
@@ -80,7 +81,7 @@ class ExpertComplex:
         self.contact_count = np.zeros(6,dtype=np.int32)
         #吸附状态
         self.adhesions = np.zeros(6,dtype=np.bool_)
-        self.max_adhesions_force = 200.0
+        self.max_adhesions_force = 300.0
         # 准静态支撑前馈：在机身 R 系中分配接触力，再映射到各腿局部 Jacobian。
         self.total_mass = self.kin.total_mass
         self.world_gravity = np.array([0.0,0.0,-9.81],dtype=np.float64)
@@ -276,6 +277,7 @@ class ExpertComplex:
         # Swing legs receive a virtual foot force that cancels their own weight.
         # The existing foot Jacobian is deliberately reused here; the full leg
         # mass is treated as an equivalent point load at the foot.
+
         swing_indices = np.flatnonzero(swing_mask)
         if swing_indices.size:
             gravity_leg = self.kin.RVectorToLeg(
@@ -328,7 +330,7 @@ class ExpertComplex:
             #假设摆动轨迹2s内完成 支撑轨迹耗时大于等于2s 就采用2s位置的se3 否则采用最后的se3
             print("len(self.interp_path_se3)=",len(self.interp_path_se3))
             # target_se3 = self.interp_path_se3[-1] if len(self.interp_path_se3)*self.dt<3.0 else self.interp_path_se3[int(3.0/self.dt)]
-            self._SwingTrajCal(self.interp_path_se3[-1])
+            self._SwingTrajCal(cur_se3,self.interp_path_se3[-1])
 
         #判断swing当前轨迹索引，并进行接触检测
         swing_dones = self._ContactDetection(q_cur,q_torque) #6维，stance腿也为False
@@ -377,7 +379,7 @@ class ExpertComplex:
                         self._SE3Interp_and_StanceCal(cur_se3)
                         print("len(self.interp_path_se3)=",len(self.interp_path_se3))
                         # target_se3 = self.interp_path_se3[-1] if len(self.interp_path_se3)*self.dt<3.0 else self.interp_path_se3[int(3.0/self.dt)]
-                        self._SwingTrajCal(self.interp_path_se3[-1])
+                        self._SwingTrajCal(cur_se3,self.interp_path_se3[-1])
                 #失败
                     #轨迹不动，继续执行释放
             #失败
@@ -411,6 +413,8 @@ class ExpertComplex:
                 #计算stance的足端在世界坐标系下的位置
         # stance_index = np.nonzero(self.gaits)[0]
         # print(f"stance W_e = {cur_se3 * self.chs._B2R(self.B_e_cur[:,stance_index],stance_index)}")
+        # print("self.gaits=",self.gaits)
+        # print("contact detection=",swing_dones)
 
     def GetJointAngles(self,q_cur:np.ndarray,real_robot=False):
         #q_cur 6,3
@@ -773,6 +777,7 @@ class ExpertComplex:
         self._ClearTraj(self.gaits)
         self.follow_path_index = 0
         self.interp_path_se3=[cur_se3]
+        self.interp_path_T = [cur_se3.A]
         stance_index = self.gaits.nonzero()[0]
         path_se3,_ = self._Start2PathSE3Interp(cur_se3) #path_se3包括了固定时间内获取到的SE3轨迹
         R_e = self.kin._B2R(self.B_e_cur[:,stance_index],stance_index)
@@ -792,12 +797,13 @@ class ExpertComplex:
             Rt_e = Rt_T_R*R_e 
             if self.hex_state.PointsFeasiCheck(se3,Rt_e.T,R_normals,stance_index,self.q3_branches[stance_index]):
                 self.interp_path_se3.append(se3)
+                self.interp_path_T.append(se3.A)
                 Bt_e = self.kin._R2B(Rt_e,stance_index)
                 for i,index in enumerate(stance_index):
                     self.B_e_traj[index].append(Bt_e[:,i])
             else:
                 break
-
+        self.interp_path_T = np.array(self.interp_path_T)
         for i,index in enumerate(stance_index):
             # print("B_e_traj[index]=",self.B_e_traj[index][:10])
             self.B_e_traj[index] = np.column_stack(self.B_e_traj[index])
@@ -909,9 +915,9 @@ class ExpertComplex:
         return interp_path_se3, path_se3
 
     #足端位置空间中的轨迹优化
-    def _SwingTrajCal(self,target_se3:SE3,debug_mode=False,debug_inputs=None):
+    def _SwingTrajCal(self,cur_se3:SE3,target_se3:SE3,debug_mode=False,debug_inputs=None):
         """
-        输入target_se3，按照足端空间中的分段B样条逻辑计算摆动腿轨迹。
+        输入target_se3，按照足端空间中的分段B样条逻辑计算摆动腿轨迹。 cur_se3是为了计算start_point的抬脚点位姿
         目前设定2s内完成摆动轨迹
         """
         if len(self.B_e_traj) != 6:
@@ -982,8 +988,12 @@ class ExpertComplex:
             start_q3_branch = int(self.q3_branches[leg_index])
             start_normal = self.B_support_n[:,leg_index]
             landing_normal = self.B_landing_n[:,leg_index]
-            raise_point,raise_dist_init = self.hex_state.FarestPoints(start_point,start_normal,target_se3,leg_index,distance=0.06)
-            down_point, down_dist_init = self.hex_state.FarestPoints(landing_point,landing_normal,target_se3,leg_index,distance=0.06)
+            raise_point,raise_dist_init = self.hex_state.FarestPoints(start_point,start_normal,cur_se3,leg_index,distance=0.08)
+            down_point, down_dist_init = self.hex_state.FarestPoints(landing_point,landing_normal,target_se3,leg_index,distance=0.08)
+            # raise_point = start_point + start_normal*0.06
+            # down_point = landing_point + landing_normal*0.06
+            # raise_dist_init = 0.06
+            # down_dist_init = 0.06
             terminal_point,_ = self.hex_state.FarestPoints(landing_point,-landing_normal,target_se3,leg_index,ignore_end=True)
             raise_dist_min = min(0.04,float(raise_dist_init))
             down_dist_min = min(0.04,float(down_dist_init))
@@ -1100,14 +1110,21 @@ class ExpertComplex:
                 branch_schema = np.array([start_q3_branch,landing_q3_branch],dtype=np.int32)
             else:
                 case_type = "normal"
+                #给ctrl1 和 ctrl2一个更靠近b 原点的初值
+                ctrl1 = 2/3*raise_point + 1/3*down_point
+                ctrl2 = 1/3*raise_point + 2/3*down_point
+                # ctrl1,_ = self.hex_state.FarestPoints(ctrl1,-ctrl1/np.linalg.norm(ctrl1),
+                #                                     target_se3,leg_index,0.12,ignore_end=True)
+                # ctrl2,_ = self.hex_state.FarestPoints(ctrl2,-ctrl2/np.linalg.norm(ctrl2),
+                #                                     target_se3,leg_index,0.12,ignore_end=True)
                 # 变量顺序: raise_dist, ctrl1, ctrl2, down_dist
                 initial_conditions = [
                     np.array([raise_dist_init],dtype=np.float32),   #0
-                    2/3*raise_point+1/3*down_point,                 #1:4
-                    1/3*raise_point+2/3*down_point,                 #4:7
+                    ctrl1,                                          #1:4
+                    ctrl2,                                          #4:7
                     np.array([down_dist_init],dtype=np.float32),    #7
                 ]
-                bounds = [(raise_dist_min,0.1)] + [(None,None)]*6 + [(down_dist_min,0.1)]
+                bounds = [(raise_dist_min,0.1)] + [(-0.32,0.32)]*6 + [(down_dist_min,0.1)]
                 Times = np.array([_TimeByPolyline([start_point,raise_point,down_point,landing_point])],dtype=np.float32)
                 branch_schema = np.array([start_q3_branch],dtype=np.int32)
 
@@ -1185,7 +1202,10 @@ class ExpertComplex:
             optimized_c_points = minimize(cost_func,initial_conditions,method='L-BFGS-B',
                                           bounds=bounds,
                                           options={"maxiter":50,"ftol":1e-4,"gtol":1e-4})
+            
             splines,Times,segment_branches = _BuildSplines(optimized_c_points.x)
+            #采用初始条件，观察轨迹
+            # splines,Times,segment_branches = _BuildSplines(initial_conditions)
             #根据 stance 的长度,stance结束时，swing也到达landing point
             self._swing_t = np.clip(len(self.interp_path_se3)*self.dt,a_min=2.5,a_max=None)
             Times = Times*(self._swing_t/np.sum(Times))
@@ -1286,10 +1306,13 @@ class ExpertComplex:
                 self.B_e_traj[leg_index] = traj
                 self.B_e_traj_len[leg_index] = traj.shape[1]
             return
-        stance_points = np.column_stack([self.B_e_traj[leg_index][:,-1] for leg_index in stance_index])
-        stance_points = self.kin._B2R(stance_points,stance_index).T
+
+        #用于计算摆动腿部碰撞
+        B_stance_points = np.column_stack([self.B_e_traj[leg_index][:,-1] for leg_index in stance_index])
+        target_R_stance_points = self.kin._B2R(B_stance_points,stance_index).T #N,3
 
         for i in range(len(future_path_se3)-1,-1,-20):
+            #未来位姿只用于筛选可行落脚点
             _,future_lp_idx,_,future_lp_mask = self.hex_state.RobotFeasiCheck(future_path_se3[i],lp_idx)
             future_lp_mask = future_lp_mask&lp_mask
             swing_has_lps_mask = future_lp_mask.any(axis=-1)
@@ -1297,13 +1320,13 @@ class ExpertComplex:
                 continue
             elif i<20:
                 print(">>>>>>> In Swing Traj Cal, there are less than one possible landing points in future pose")
-                print(f"future pose={future_path_se3[i]}\n landing points\n{self.hex_state.env_pointsmap_voxels.landing_points[future_lp_idx]}")
+                print(f"future pose={target_se3}\n landing points\n{self.hex_state.env_pointsmap_voxels.landing_points[future_lp_idx]}")
                 
             for leg_index in swing_index:
                 pointmap = self.hex_state.env_pointsmap_voxels
                 possible_points = (target_se3.inv() * (pointmap.landing_points[future_lp_idx[swing_has_lps_mask[leg_index]]].T)).T
                 mask = self.hex_state._LegLegCollisionFree(
-                    possible_points,stance_points,self.q3_branches[stance_index],leg_index,stance_index
+                    possible_points,target_R_stance_points,self.q3_branches[stance_index],leg_index,stance_index
                 )
                 future_lp_mask[leg_index,swing_has_lps_mask[leg_index]] &= mask
             if (np.sum(future_lp_mask[swing_index,...].any(axis=-1),axis=1)>=3).all():
@@ -1324,7 +1347,8 @@ class ExpertComplex:
             if chosen_lp_idx.size == 0:
                 print("leg_index={}, q3_branches={}".format(leg_index,self.q3_branches[leg_index]))
                 print("future_lp_mask true sum =",future_lp_mask.sum())
-                raise RuntimeError("chosen lp idex get empty value")
+                # raise RuntimeError("chosen lp idex get empty value")
+                print(">>>>>>>>>>>chosen lp index get empty value<<<<<<<<<<<,")
                 continue
             #3,N
             R_points = target_se3.inv() * self.hex_state.env_pointsmap_voxels.landing_points[chosen_lp_idx].T
@@ -1373,12 +1397,18 @@ class ExpertComplex:
         if smooth_cost is None:
             smooth_cost = self.trapezoid(np.sum(acc_u_scaled**2,axis=0),u)
         R_points = self.kin._B2R(B_points,leg_index)
-        W_points = target_se3*R_points                
+        #计算R point在世界系下的位置，需要预估R系与世界系的相对位置关系 在gait planning中，swing和stance是同时出发的
+        B_time_steps = np.clip(np.arange(B_points.shape[1]),a_min=0,a_max=len(self.interp_path_T)-1)
+        #M,4,4 4,M -> M,4        
+        W_points = np.einsum("mij,im->mj",
+                             self.interp_path_T[B_time_steps],
+                             np.vstack([R_points,np.ones((R_points.shape[1]))]))[:,:3]
+        # W_points = target_se3*R_points                
         #计算身体碰撞与环境碰撞ESDF代价
-        env_esdf = self._QueryESDFTrilinear(W_points.T,
+        env_esdf = self._QueryESDFTrilinear(W_points,
                                             self.hex_state.env_pointsmap_voxels.voxels,
                                             self.hex_state.env_pointsmap_voxels.env_esdf)
-        env_collision_cost = np.square(np.clip(0.04-env_esdf,a_min=0,a_max=None)).sum()
+        env_collision_cost = np.square(np.clip(0.06-env_esdf,a_min=0,a_max=None)).sum()
 
         #足部末端点与身体碰撞的惩罚等价于worksapce far cost 这里就不重复添加
         # body_esdf = self._QueryESDFTrilinear(R_points.T,
@@ -1390,6 +1420,7 @@ class ExpertComplex:
                                                  self.hex_state.robot_voxels.leg_voxels,
                                                  self.hex_state.robot_voxels.to_bound_dist[...,leg_index])
         worksapce_far_cost = np.square(np.clip(0.0-to_bound_esdf,a_min=0.0,a_max=None)).sum()
+
         # ix,iy,iz = self.hex_state.robot_voxels.body_voxels.Pos2GridIndex(R_points.T).T
         # body_collision_cost = np.square(np.clip(0.04-self.hex_state.robot_voxels.body_voxels.esdf[ix,iy,iz],a_min=0,a_max=None)).sum()
         #计算靠近工作空间中心代价
@@ -1413,8 +1444,9 @@ class ExpertComplex:
 
         #轨迹长度代价 长度代价效果很差导致曲线扭曲 光滑代价能达到同样的效果 这里取消
         # length_cost = np.linalg.norm(np.diff(B_points,axis=1),axis=0).sum()
-        cost = smooth_cost + worksapce_far_cost  + 5.0*env_collision_cost #+ankle_collision_cost
-        # cost = smooth_cost  + 5.0*env_collision_cost #+ankle_collision_cost
+        # print("smooth_cost={},workspace_far_cost={},env_collision_cost={}".format(smooth_cost,worksapce_far_cost,env_collision_cost))
+        cost = 0.2*smooth_cost + 0.3*worksapce_far_cost  #+ 5.0*env_collision_cost #+ankle_collision_cost
+        # cost = smooth_cost + 5.0*env_collision_cost #+ankle_collision_cost
 
         return cost                
 

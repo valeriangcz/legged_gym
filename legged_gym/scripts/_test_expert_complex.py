@@ -56,7 +56,7 @@ path_se3 = []
 # for i in range(100):
 #     path_se3.append(SE3(0.345,1.24,0.24+i*0.02))
 #从.json文件中读取
-path_file = Path(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path/initial_se3_path_20260927_195818.json")
+path_file = Path(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path/initial_se3_path_20260928_174515.json")
 path_se3 = LoadFromBezierFile(path_file)
 # path_file = Path(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path/teleop_demo_20260927_194709.json")
 # path_se3 = LoadFromTeletopFile(path_file)
@@ -70,7 +70,7 @@ q_init,tau_ff,adhesions = expert_complex.SetInitBySE3()
 env_cfg = HexClimbCfg()
 # env_cfg.terrain.mesh_type='plane'
 # env_cfg.terrain.stl_files = os.path.join(LEGGED_GYM_ROOT_DIR,"resources/environments/sutructure1/complex_surface.STL")
-env_cfg.terrain.stl_files = os.path.join(LEGGED_GYM_ROOT_DIR,"resources/environments/structure2/regular_dodecagon.STL")
+env_cfg.terrain.stl_files = os.path.join(LEGGED_GYM_ROOT_DIR,"resources/environments/structure2/complex_surface3.STL")
 env_cfg.env.num_envs = 1
 env_cfg.domain_rand.randomize_friction = False
 env_cfg.domain_rand.push_robots = False
@@ -109,7 +109,8 @@ for _ in range(100):
 points = []
 for se3 in path_se3:
     points.append(se3.t)
-DrawPoints(np.vstack(points),color=(0,1,0))
+path_points = np.vstack(points)
+DrawPoints(path_points,color=(0,1,0))
 # DrawPoints(np.array([[0.95046371, 0.94990469, 1.48896125],[2.20247165, 2.81674108, 2.51181516],[0.03845775, 0.03841578, 0.03841838]]).T,color=(0,0,1))
 groups_drawed = False
 last_stance_group_index = expert_complex.stance_group_index
@@ -155,6 +156,9 @@ while not env.gym.query_viewer_has_closed(env.viewer):
         )
         #可视化专家轨迹
         if not groups_drawed:
+            #先清理之前的线条
+            env.gym.clear_lines(env.viewer)
+            DrawPoints(path_points,color=(0,1,0))
             #将swing 和 stance 轨迹绘制出来
             if (expert_complex.B_e_traj_len > 1).any():
                 for i in range(6):
@@ -169,6 +173,7 @@ while not env.gym.query_viewer_has_closed(env.viewer):
                 points.append(se3.t)
             points = np.vstack(points)
             DrawPoints(points,color=(0,1,1))
+            
             groups_drawed = True
         if last_stance_group_index != expert_complex.stance_group_index:
             groups_drawed = False

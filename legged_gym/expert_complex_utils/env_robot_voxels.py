@@ -666,7 +666,9 @@ class HexState:
         self.robot_voxels = RoboVoxels(kinematic=self.kin)
         self.env_pointsmap_voxels = EnvPointsVoxels(
         # LEGGED_GYM_ROOT_DIR+"/resources/environments/sutructure1/complex_surface_point_map.npz")
-        LEGGED_GYM_ROOT_DIR+"/resources/environments/structure2/regular_dodecagon_point_map.npz")
+        # LEGGED_GYM_ROOT_DIR+"/resources/environments/structure2/regular_dodecagon_point_map.npz")
+        LEGGED_GYM_ROOT_DIR+"/resources/environments/structure2/complex_surface3_point_map.npz")
+        
 
     def _LegNormFeasi(self,R_points:np.ndarray,R_normals:np.ndarray,leg_index:Union[np.ndarray|int]):
         """检查这一点是否法向量可行, 先检查这一点法向量与腿部连杆所在平面的夹角是否在范围内，再选出两个解中哪一个解的x_b3可行
@@ -783,7 +785,7 @@ class HexState:
         
         #N*2,1,3 - 1,M,3 - -> N*2,M,3 -> N*2,M
         distance = np.linalg.norm(checking_ankle_pos[:,None,:]-stance_ankle_pos[None,...],axis=-1)
-        ankle_free_mask = (distance>=self.robot_voxels.leg_voxels.ankle_collide_radi).all(axis=1) #N*2
+        ankle_free_mask = (distance>=self.robot_voxels.leg_voxels.ankle_collide_radi*2).all(axis=1) #N*2
         ankle_free_mask = ankle_free_mask.reshape(-1,2)
 
         return end_free_mask&ankle_free_mask
@@ -850,7 +852,7 @@ class HexState:
             _flat_index = self.robot_voxels.leg_voxels.Pos2FlatIndex(B_points)
             # inside_leg_range_mask = self.robot_voxels.robot_reachable_legs[_flat_index,:,i] #N,2
             # inside_leg_range_mask = self.robot_voxels.to_bound_dist_flat[_flat_index,i]>=0.042 #N
-            inside_leg_range_mask = self.robot_voxels.to_bound_dist_flat[_flat_index,i]>=0.0 #N
+            inside_leg_range_mask = self.robot_voxels.to_bound_dist_flat[_flat_index,i]>=0.04 #N
             # N,2 & N,1 -> N,2
             inside_leg_range_mask &= (np.linalg.norm(self.robot_voxels.leg_voxels.center[_flat_index],axis=1)<=0.3)
 
@@ -1311,7 +1313,7 @@ class HexState:
 
         # reachable_mask = self.robot_voxels.robot_reachable_legs[flat_index,sol_indices,leg_indices]#N
         # reachable_mask = self.robot_voxels.to_bound_dist_flat[flat_index,leg_indices] >= 0.04
-        reachable_mask = self.robot_voxels.to_bound_dist_flat[flat_index,leg_indices] >= 0.0
+        reachable_mask = self.robot_voxels.to_bound_dist_flat[flat_index,leg_indices] >= 0.02
         reachable_mask &= np.linalg.norm( self.robot_voxels.leg_voxels.center[flat_index],axis=1 ) <= 0.32
 
         ankle_pos = np.nan_to_num(self.robot_voxels.leg_voxels.ankle_pos[flat_index,sol_indices],nan=0.0)

@@ -116,8 +116,8 @@ class HexClimbCfg(LeggedRobotCfg):
                     damping['j_'+t+'_'+qn] = 0.1                  
         action_scale=1.2
         decimation = 4
-        suction_force_delt=20 #每0.01s，释放时减少的力，吸附时吸力变化是其5倍
-        suction_force_max=200.0 #300N是最电磁铁大吸附力
+        suction_force_delt=30 #每0.01s，释放时减少的力，吸附时吸力变化是其5倍
+        suction_force_max=300.0 #300N是最电磁铁大吸附力
 
     class asset(LeggedRobotCfg.asset):
         # file=f"{LEGGED_GYM_ROOT_DIR}/resources/robots/hex_v4/urdf/hex_climb.urdf"
@@ -230,8 +230,8 @@ class HexClimbCfg(LeggedRobotCfg):
         ref_env = 0
         # pos = [1.2,3,1.5]
         # lookat = [0.9,2,1.0]
-        pos = [0.0,3,1.5]
-        lookat = [1.2,4.1,0.65]        
+        pos = [2.5,4.2,0.6]
+        lookat = [2.5,3.4,0.48]        
         
     class sim(LeggedRobotCfg.sim):
         dt = 0.0025

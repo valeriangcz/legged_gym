@@ -3,15 +3,15 @@ import numpy as np
 
 
 ro = RoboVoxels(Kinematic())
-# ro.PlotRobotVoxels()
+ro.PlotRobotVoxels()
 
-flat_index = ro.body_voxels.Pos2FlatIndex(np.array(
-    [[0.4,0.0,-0.0],
-     [0,-0.5,-0.1]]))
+# flat_index = ro.body_voxels.Pos2FlatIndex(np.array(
+#     [[0.4,0.0,-0.0],
+#      [0,-0.5,-0.1]]))
 
-print("esdf=",ro.body_voxels.esdf_flat_for_env[flat_index])
-from spatialmath import SE3,SO3
-import numpy as np
+# print("esdf=",ro.body_voxels.esdf_flat_for_env[flat_index])
+# from spatialmath import SE3,SO3
+# import numpy as np
 
 # from pathlib import Path
 # from legged_gym import LEGGED_GYM_ROOT_DIR
