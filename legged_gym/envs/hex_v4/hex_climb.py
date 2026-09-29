@@ -3,13 +3,14 @@ from legged_gym.envs.hex_v4.hex_climb_config import HexClimbCfg, HexClimbCfgPPO
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.utils.actuator import Actuator
 from legged_gym.envs.hex_v4.expert import ExpertClimb
-from isaacgym import gymtorch, gymapi
-from isaacgym.torch_utils import to_torch, get_axis_params, quat_rotate_inverse,torch_rand_float
+from isaacgym import gymtorch, gymapi, gymutil
+from isaacgym.torch_utils import to_torch, quat_apply, quat_rotate_inverse,torch_rand_float
 import trimesh
 import torch
 import numpy as np
+import math
 import os
-from typing import Optional
+from typing import Callable, Optional
 
 class HexClimb(LeggedRobot):
     def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
@@ -19,6 +20,15 @@ class HexClimb(LeggedRobot):
         self.foot_traj_vis=False
         self.actuator = Actuator(self.cfg,self.device)
         self.expert = ExpertClimb(self.cfg,self.device,self.cfg.env.num_envs)
+        if getattr(self, "_record_mass_scaling_active", False):
+            self.expert.set_total_mass(self.record_total_masses)
+        gravity_visualization_length = float(
+            getattr(self.cfg.env, "gravity_visualization_length", 0.25)
+        )
+        self.gravity_axes_geometry = gymutil.AxesGeometry(gravity_visualization_length)
+        self.gravity_tip_geometry = gymutil.WireframeSphereGeometry(
+            0.012, 6, 6, None, color=(0.1, 0.8, 1.0)
+        )
         self.obs_scales = self.cfg.normalization.obs_scales
         #设置仿真属性，用于调整重力
         self.sim_params:gymapi.SimParams
@@ -34,7 +44,8 @@ class HexClimb(LeggedRobot):
         self.actions = torch.clip(actions, -clip_actions, clip_actions).to(self.device)
         return self._step_with_commands()
 
-    def step_q_tao(self,q_des:torch.Tensor,tau_ff:torch.Tensor,adhesions:torch.Tensor):
+    def step_q_tao(self,q_des:torch.Tensor,tau_ff:torch.Tensor,adhesions:torch.Tensor,
+                   physics_step_callback:Optional[Callable[["HexClimb"],None]]=None):
         """以绝对关节位置和主电机前馈扭矩推进一个控制步。
 
         Args:
@@ -66,10 +77,12 @@ class HexClimb(LeggedRobot):
             q_des-self.default_dof_pos[:,self.dof_drive_indices]
         )/self.cfg.control.action_scale
         self.actions[:,24:30] = adhesions
-        return self._step_with_commands(q_des=q_des,tau_ff=tau_ff)
+        return self._step_with_commands(q_des=q_des,tau_ff=tau_ff,
+                                        physics_step_callback=physics_step_callback)
 
     def _step_with_commands(self,q_des:Optional[torch.Tensor]=None,
-                            tau_ff:Optional[torch.Tensor]=None):
+                            tau_ff:Optional[torch.Tensor]=None,
+                            physics_step_callback:Optional[Callable[["HexClimb"],None]]=None):
         """执行共享的物理步进；q_des 为 None 时沿用缩放 action 接口。"""
         # step physics and render each frame
         self.render()
@@ -91,6 +104,9 @@ class HexClimb(LeggedRobot):
             if self.device=='cpu':
                 self.gym.fetch_results(self.sim,True)
             self.gym.refresh_dof_state_tensor(self.sim)
+            if physics_step_callback is not None:
+                self._refresh_recording_tensors()
+                physics_step_callback(self)
         self.post_physics_step()
         # print("contact force=\n",self.contact_forces[:,self.feet_indices,2])
         clip_obs = self.cfg.normalization.clip_observations
@@ -114,7 +130,15 @@ class HexClimb(LeggedRobot):
         self.base_ang_vel = quat_rotate_inverse(self.base_quat,self.root_states[:,10:13])
         self.projected_gravity = quat_rotate_inverse(self.base_quat,self.gravity_vec)
 
-        root_acc = ((self.root_states[:,7:10] -  self.last_root_vel[:,:3])/self.dt)/9.81 - self.gravity_vec
+        world_lin_acc = (self.root_states[:,7:10] - self.last_root_vel[:,:3])/self.dt
+        if self.gravity_norm > 0.0:
+            # Keep the IMU-style observation expressed in units of the
+            # configured gravity magnitude rather than assuming earth gravity.
+            root_acc = world_lin_acc/self.gravity_norm - self.gravity_vec
+        else:
+            # A gravity-normalized acceleration is undefined in zero gravity.
+            # Preserve the physical world-frame acceleration instead.
+            root_acc = world_lin_acc - self.gravity_vec
         self.base_lin_acc = quat_rotate_inverse(self.base_quat,root_acc)
 
         self._post_physics_step_callback()
@@ -128,6 +152,9 @@ class HexClimb(LeggedRobot):
         self.last_actions[:]=self.actions[:]
         self.last_dof_vel[:]=self.dof_vel[:]
         self.last_root_vel[:]=self.root_states[:,7:13]
+
+        if self.viewer is not None and getattr(self.cfg.env, "visualize_gravity", False):
+            self._draw_gravity_vectors()
 
 
     def check_termination(self):
@@ -178,7 +205,7 @@ class HexClimb(LeggedRobot):
         q_dot_cur = self.dof_vel[:,self.dof_motor_drive_indices].clone()
         adhesion_force = self.rb_forces[:,self.feet_indices,2].clone().abs()
         contact_force = self.contact_forces[:,self.feet_indices,2].clone().abs()
-        gravity_R = self.projected_gravity*9.81
+        gravity_R = self.projected_gravity*self.gravity_norm
         adhesions, q_des, tau_ff = self.expert.ProcessCommand(
             command,q_cur,q_dot_cur,adhesion_force,contact_force,gravity_R
         )
@@ -241,9 +268,17 @@ class HexClimb(LeggedRobot):
         actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
         dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
         net_contact_forces = self.gym.acquire_net_contact_force_tensor(self.sim)
+        if self.recording_sensors_enabled:
+            rigid_body_state = self.gym.acquire_rigid_body_state_tensor(self.sim)
+            force_sensor_tensor = self.gym.acquire_force_sensor_tensor(self.sim)
+            dof_force_tensor = self.gym.acquire_dof_force_tensor(self.sim)
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_net_contact_force_tensor(self.sim)
+        if self.recording_sensors_enabled:
+            self.gym.refresh_rigid_body_state_tensor(self.sim)
+            self.gym.refresh_force_sensor_tensor(self.sim)
+            self.gym.refresh_dof_force_tensor(self.sim)
 
         # create some wrapper tensors for different slices
         self.root_states = gymtorch.wrap_tensor(actor_root_state)
@@ -255,12 +290,39 @@ class HexClimb(LeggedRobot):
         self.base_pos = self.root_states[:,0:3]
 
         self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3) # shape: num_envs, num_bodies, xyz axis
+        if self.recording_sensors_enabled:
+            self.rigid_body_states = gymtorch.wrap_tensor(rigid_body_state).view(
+                self.num_envs, self.num_bodies, 13
+            )
+            self.force_sensor_forces = gymtorch.wrap_tensor(force_sensor_tensor).view(
+                self.num_envs, self.record_joint_sensor_count, 6
+            )
+            self.dof_force = gymtorch.wrap_tensor(dof_force_tensor).view(
+                self.num_envs, self.num_dof
+            )
 
         # initialize some data used later on
         self.common_step_counter = 0
         self.extras = {}
         self.noise_scale_vec = self._get_noise_scale_vec()
-        self.gravity_vec = to_torch(get_axis_params(-1., self.up_axis_idx), device=self.device).repeat((self.num_envs, 1))
+        gravity_world = torch.as_tensor(
+            self.cfg.sim.gravity, dtype=torch.float, device=self.device
+        ).reshape(-1)
+        if gravity_world.numel() != 3:
+            raise ValueError(
+                "cfg.sim.gravity must contain exactly three world-frame components"
+            )
+        if not torch.isfinite(gravity_world).all():
+            raise ValueError("cfg.sim.gravity must contain only finite values")
+
+        self.gravity_norm = torch.linalg.vector_norm(gravity_world)
+        if self.gravity_norm > 0.0:
+            gravity_unit = gravity_world/self.gravity_norm
+        else:
+            # The direction is undefined in zero gravity; use a zero vector so
+            # projected gravity and expert gravity feedforward remain finite.
+            gravity_unit = torch.zeros_like(gravity_world)
+        self.gravity_vec = gravity_unit.unsqueeze(0).repeat((self.num_envs, 1))
         self.torques = torch.zeros(self.num_envs, self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
         self.actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
         self.last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
@@ -279,9 +341,20 @@ class HexClimb(LeggedRobot):
         self.rb_forces = torch.zeros_like(self.contact_forces) #用于给足端施加吸力
         self.pos_rb_forces = torch.zeros_like(self.contact_forces) #指定给足施加吸附力的位置
         env_indices = torch.arange(self.num_envs,dtype=torch.long,device=self.device).unsqueeze(1)
-        self.pos_rb_forces[env_indices,self.magnetic_indices[:,0].unsqueeze(0),:] = torch.tensor([0,0.02,-0.009],device=self.device,dtype=torch.float)
-        self.pos_rb_forces[env_indices,self.magnetic_indices[:,1].unsqueeze(1),:] = torch.tensor([0.02 * 3**0.5,-0.01,-0.009],device=self.device,dtype=torch.float)
-        self.pos_rb_forces[env_indices,self.magnetic_indices[:,2].unsqueeze(1),:] = torch.tensor([-0.02 * 3**0.5,-0.01,-0.009],device=self.device,dtype=torch.float)
+        # Both advanced indices must broadcast to (num_envs, 6).  Keep the
+        # magnetic-point dimension in axis 1 for every one of the three cup
+        # force locations; ``unsqueeze(1)`` here would instead produce the
+        # incompatible shapes (num_envs, 1) and (6, 1).
+        magnetic_force_positions = torch.tensor(
+            [[0.0, 0.03, -0.009],
+             [0.03 * 3**0.5, -0.015, -0.009],
+             [-0.03 * 3**0.5, -0.015, -0.009]],
+            device=self.device, dtype=torch.float,
+        )
+        for point_index, position in enumerate(magnetic_force_positions):
+            self.pos_rb_forces[
+                env_indices, self.magnetic_indices[:,point_index].unsqueeze(0), :
+            ] = position
         self.dof_pos_des = torch.zeros_like(self.dof_pos) #这里是关节期望的角度，包含了被动关节，其期望值一直为0
         # self.adhesions = torch.zeros(self.num_envs,6,dtype=torch.bool,device=self.device,requires_grad=False)
 
@@ -297,6 +370,177 @@ class HexClimb(LeggedRobot):
             self.default_dof_pos[i] = angle
         #为了方便期望关节位置的计算，还需要计算一个没有被动关节的默认关节角度
         self.default_dof_pos = self.default_dof_pos.unsqueeze(0)
+
+    def _refresh_recording_tensors(self):
+        """Refresh all tensors consumed by a physics-step recording callback."""
+        if not self.recording_sensors_enabled:
+            return
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+        self.gym.refresh_net_contact_force_tensor(self.sim)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
+        self.gym.refresh_force_sensor_tensor(self.sim)
+        self.gym.refresh_dof_force_tensor(self.sim)
+
+    def _draw_gravity_vectors(self):
+        """Draw a world-frame gravity direction marker from every base origin.
+
+        ``gravity_vec`` is already the configured unit gravity direction in
+        world axes.  The visual length is intentionally independent of the
+        gravity magnitude so Earth, Mars and tilted-gravity cases remain easy
+        to compare in the viewer.  The built-in AxesGeometry local +Z axis is
+        aligned to gravity; the built-in WireframeSphereGeometry marks its tip.
+        """
+        if self.gravity_norm <= 0.0:
+            return
+        arrow_length = float(getattr(self.cfg.env, "gravity_visualization_length", 0.25))
+        if arrow_length <= 0.0:
+            return
+
+        self.gym.clear_lines(self.viewer)
+        origins = self.root_states[:,:3].detach().cpu().numpy()
+        directions = self.gravity_vec.detach().cpu().numpy()
+
+        for env_id, (origin, direction) in enumerate(zip(origins, directions)):
+            direction_norm = np.linalg.norm(direction)
+            if direction_norm == 0.0:
+                continue
+            direction = direction/direction_norm
+            end = origin + arrow_length*direction
+            z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            rotation_axis = np.cross(z_axis, direction)
+            axis_norm = np.linalg.norm(rotation_axis)
+            dot_product = float(np.clip(np.dot(z_axis, direction), -1.0, 1.0))
+            if axis_norm < 1e-6:
+                # +Z and gravity are parallel (identity) or anti-parallel
+                # (180 degrees about +X).
+                orientation = (gymapi.Quat()
+                               if dot_product >= 0.0
+                               else gymapi.Quat(1.0, 0.0, 0.0, 0.0))
+            else:
+                rotation_axis /= axis_norm
+                orientation = gymapi.Quat.from_axis_angle(
+                    gymapi.Vec3(*rotation_axis), math.acos(dot_product)
+                )
+
+            axes_pose = gymapi.Transform()
+            axes_pose.p = gymapi.Vec3(*origin)
+            axes_pose.r = orientation
+            gymutil.draw_lines(
+                self.gravity_axes_geometry, self.gym, self.viewer,
+                self.envs[env_id], axes_pose
+            )
+            tip_pose = gymapi.Transform()
+            tip_pose.p = gymapi.Vec3(*end)
+            gymutil.draw_lines(
+                self.gravity_tip_geometry, self.gym, self.viewer,
+                self.envs[env_id], tip_pose
+            )
+
+    @staticmethod
+    def _rotate_inverse_batched(quat:torch.Tensor, vector:torch.Tensor)->torch.Tensor:
+        return quat_rotate_inverse(
+            quat.reshape(-1,4), vector.reshape(-1,3)
+        ).reshape_as(vector)
+
+    def get_recording_telemetry(self):
+        """Return recording tensors after a physics step.
+
+        This method is intentionally unavailable outside the explicit recording
+        mode so normal training does not acquire extra Isaac Gym tensors.
+        Wrenches are force-first: ``[Fx, Fy, Fz, Mx, My, Mz]``.
+        """
+        if not self.recording_sensors_enabled:
+            raise RuntimeError(
+                "recording sensors are disabled; set cfg.env.enable_recording_sensors=True before creation"
+            )
+
+        body_state = self.rigid_body_states
+        parent_state = body_state[:,self.record_joint_parent_indices,:]
+        child_state = body_state[:,self.record_joint_child_indices,:]
+        raw_wrench_world = self.force_sensor_forces
+        raw_force_world = raw_wrench_world[...,:3]
+        raw_moment_world = raw_wrench_world[...,3:]
+
+        # Move each sensor wrench from its child-link origin to the parent-link
+        # origin, then rotate it into the parent link's current local axes.
+        arm_world = child_state[...,:3]-parent_state[...,:3]
+        moment_at_parent_world = raw_moment_world + torch.cross(
+            arm_world, raw_force_world, dim=-1
+        )
+        force_parent = self._rotate_inverse_batched(
+            parent_state[...,3:7], raw_force_world
+        )
+        moment_parent = self._rotate_inverse_batched(
+            parent_state[...,3:7], moment_at_parent_world
+        )
+        # Isaac Gym reports the force on the sensor's child side.  The public
+        # signal is the equal-and-opposite load of that downstream assembly on
+        # its parent link.
+        joint_wrench_parent = -torch.cat((force_parent,moment_parent),dim=-1)
+
+        magnetic_flat = self.magnetic_indices.reshape(-1)
+        magnetic_state = body_state[:,magnetic_flat,:].view(self.num_envs,6,3,13)
+        magnetic_force_local = self.rb_forces[:,magnetic_flat,:].view(
+            self.num_envs,6,3,3
+        )
+        magnetic_pos_local = self.pos_rb_forces[:,magnetic_flat,:].view(
+            self.num_envs,6,3,3
+        )
+        magnetic_quat = magnetic_state[...,3:7]
+        magnetic_force_world = quat_apply(
+            magnetic_quat.reshape(-1,4), magnetic_force_local.reshape(-1,3)
+        ).view(self.num_envs,6,3,3)
+        magnetic_point_world = magnetic_state[...,:3] + quat_apply(
+            magnetic_quat.reshape(-1,4), magnetic_pos_local.reshape(-1,3)
+        ).view(self.num_envs,6,3,3)
+        cup_state = body_state[:,self.record_cup_reference_indices,:]
+        cup_position_world = cup_state[...,:3]
+        adhesion_force_world = magnetic_force_world.sum(dim=2)
+        adhesion_moment_world = torch.cross(
+            magnetic_point_world-cup_position_world.unsqueeze(2),
+            magnetic_force_world, dim=-1
+        ).sum(dim=2)
+        surface_force_world = self.contact_forces[:,magnetic_flat,:].view(
+            self.num_envs,6,3,3
+        ).sum(dim=2)
+
+        body_quat = body_state[...,3:7]
+        local_com = self.record_body_com_local.unsqueeze(0).expand(
+            self.num_envs,-1,-1
+        )
+        com_offset_world = quat_apply(
+            body_quat.reshape(-1,4), local_com.reshape(-1,3)
+        ).view(self.num_envs,self.num_bodies,3)
+        body_com_velocity = body_state[...,7:10] + torch.cross(
+            body_state[...,10:13], com_offset_world, dim=-1
+        )
+        masses = self.record_body_masses.unsqueeze(-1)
+        com_velocity_world = (body_com_velocity*masses).sum(dim=1)/masses.sum(dim=1)
+        com_velocity_body = quat_rotate_inverse(
+            self.root_states[:,3:7], com_velocity_world
+        )
+
+        return {
+            "joint_position": self.dof_pos,
+            "joint_velocity": self.dof_vel,
+            "actuator_torque": self.torques,
+            "dof_generalized_force": self.dof_force,
+            "joint_sensor_wrench_world_raw": raw_wrench_world,
+            "joint_sensor_origin_world": child_state[...,:3],
+            "joint_parent_pose_world": parent_state[...,:7],
+            "joint_wrench_parent": joint_wrench_parent,
+            "com_velocity_world": com_velocity_world,
+            "com_velocity_body": com_velocity_body,
+            "desired_velocity_body": self.commands[:,:3],
+            "adhesion_command_wrench_world": torch.cat(
+                (adhesion_force_world,adhesion_moment_world), dim=-1
+            ),
+            "surface_force_world": surface_force_world,
+            "cup_interface_wrench_parent": joint_wrench_parent.view(
+                self.num_envs,6,5,6
+            )[:,:,-1,:],
+            "cup_reference_pose_world": cup_state[...,:7],
+        }
 
     def _create_envs(self):
         #这里要修改机器人的初始位姿，增加了电机舵机对应关节驱动的索引
@@ -337,6 +581,7 @@ class HexClimb(LeggedRobot):
         print(dof_props_asset)
         # save body names from the asset
         body_names = self.gym.get_asset_rigid_body_names(robot_asset)
+        self.body_names = body_names
         self.dof_names = self.gym.get_asset_dof_names(robot_asset)
         print("dof names\n",self.dof_names)
         print(f"dof_names length={len(self.dof_names)}")
@@ -349,6 +594,58 @@ class HexClimb(LeggedRobot):
         for name in self.cfg.asset.terminate_after_contacts_on:
             termination_contact_names.extend([s for s in body_names if name in s])
 
+        self.recording_sensors_enabled = bool(
+            getattr(self.cfg.env, "enable_recording_sensors", False)
+        )
+        self._record_mass_scaling_active = (
+            getattr(self.cfg.env, "record_mass_scales", None) is not None
+        )
+        configured_mass_scales = getattr(self.cfg.env, "record_mass_scales", None)
+        if self._record_mass_scaling_active:
+            if len(configured_mass_scales) != self.num_envs:
+                raise ValueError(
+                    "record_mass_scales must contain one value for every environment"
+                )
+            if any((not np.isfinite(scale)) or scale <= 0.0
+                   for scale in configured_mass_scales):
+                raise ValueError("record_mass_scales values must be finite and positive")
+
+        self.record_joint_sensor_specs = []
+        if self.recording_sensors_enabled:
+            # The sensor frame is placed at the child-link origin.  During
+            # recording the wrench is shifted to, and expressed in, the parent
+            # link frame before it is exposed to the caller.
+            sensor_props = gymapi.ForceSensorProperties()
+            sensor_props.enable_forward_dynamics_forces = False
+            sensor_props.enable_constraint_solver_forces = True
+            sensor_props.use_world_frame = True
+            sensor_pose = gymapi.Transform()
+            asset_leg_order = ["rf", "rm", "rb", "lf", "lm", "lb"]
+            for leg in asset_leg_order:
+                joint_links = [
+                    ("thigh", "body", f"l_{leg}_thigh"),
+                    ("knee", f"l_{leg}_thigh", f"l_{leg}_knee"),
+                    ("ankle", f"l_{leg}_knee", f"l_{leg}_ankle"),
+                    ("foot", f"l_{leg}_ankle", f"l_{leg}_foot"),
+                    # This interface carries ball1, ball2, suck, toe and
+                    # empty as one downstream cup assembly.
+                    ("ball", f"l_{leg}_foot", f"l_{leg}_ball1"),
+                ]
+                for joint, parent_name, child_name in joint_links:
+                    if child_name not in body_names or parent_name not in body_names:
+                        raise RuntimeError(
+                            f"recording sensor body is missing: {parent_name} -> {child_name}"
+                        )
+                    self.gym.create_asset_force_sensor(
+                        robot_asset, body_names.index(child_name), sensor_pose, sensor_props
+                    )
+                    self.record_joint_sensor_specs.append({
+                        "label": f"{leg}_{joint}",
+                        "parent": parent_name,
+                        "child": child_name,
+                    })
+        self.record_joint_sensor_count = len(self.record_joint_sensor_specs)
+
         base_init_state_list = self.cfg.init_state.pos + self.cfg.init_state.rot + self.cfg.init_state.lin_vel + self.cfg.init_state.ang_vel
         self.base_init_state = to_torch(base_init_state_list, device=self.device, requires_grad=False)
         start_pose = gymapi.Transform()
@@ -359,6 +656,12 @@ class HexClimb(LeggedRobot):
         env_upper = gymapi.Vec3(0., 0., 0.)
         self.actor_handles = []
         self.envs = []
+        recorded_masses = []
+        recorded_coms = None
+        fixed_friction = getattr(self.cfg.env, "record_fixed_friction", None)
+        if fixed_friction is not None:
+            if not np.isfinite(fixed_friction) or fixed_friction < 0.0:
+                raise ValueError("record_fixed_friction must be finite and non-negative")
         for i in range(self.num_envs):
             # create env instance
             env_handle = self.gym.create_env(self.sim, env_lower, env_upper, int(np.sqrt(self.num_envs)))
@@ -367,6 +670,9 @@ class HexClimb(LeggedRobot):
             # pos[:2] += torch_rand_float(-1., 1., (2,1), device=self.device).squeeze(1)
             # start_pose.p = gymapi.Vec3(*pos)
             rigid_shape_props = self._process_rigid_shape_props(rigid_shape_props_asset, i)
+            if fixed_friction is not None:
+                for shape_prop in rigid_shape_props:
+                    shape_prop.friction = float(fixed_friction)
             # print("rigid shape friction\n")
             # for i,s in enumerate(rigid_shape_props):
             #     print(f"i={i}; s.frictions={s.friction}")
@@ -376,9 +682,30 @@ class HexClimb(LeggedRobot):
             self.gym.set_actor_dof_properties(env_handle, actor_handle, dof_props)
             body_props = self.gym.get_actor_rigid_body_properties(env_handle, actor_handle)
             body_props = self._process_rigid_body_props(body_props, i)
+            if self._record_mass_scaling_active:
+                for body_prop in body_props:
+                    body_prop.mass *= float(configured_mass_scales[i])
             self.gym.set_actor_rigid_body_properties(env_handle, actor_handle, body_props, recomputeInertia=True)
+            if self.recording_sensors_enabled or self._record_mass_scaling_active:
+                recorded_masses.append([body_prop.mass for body_prop in body_props])
+                if recorded_coms is None:
+                    recorded_coms = [
+                        [body_prop.com.x, body_prop.com.y, body_prop.com.z]
+                        for body_prop in body_props
+                    ]
+            if self.recording_sensors_enabled:
+                self.gym.enable_actor_dof_force_sensors(env_handle, actor_handle)
             self.envs.append(env_handle)
             self.actor_handles.append(actor_handle)
+
+        if self.recording_sensors_enabled or self._record_mass_scaling_active:
+            self.record_body_masses = torch.tensor(
+                recorded_masses, dtype=torch.float32, device=self.device
+            )
+            self.record_body_com_local = torch.tensor(
+                recorded_coms, dtype=torch.float32, device=self.device
+            )
+            self.record_total_masses = self.record_body_masses.sum(dim=1)
 
         self.feet_indices = torch.zeros(len(feet_names), dtype=torch.long, device=self.device, requires_grad=False)
         for i in range(len(feet_names)):
@@ -411,16 +738,45 @@ class HexClimb(LeggedRobot):
         self.dof_drive_indices=torch.sort(self.dof_drive_indices)[0] #排序，保证自由度的顺序是一条腿一条腿来的，不排序就是按照所有的thigh，所有的knee，..这样
         self.dof_motor_drive_indices=torch.sort(self.dof_motor_drive_indices)[0]
 
-        #额外增加用于模拟电磁铁的三个关节的索引 suck toe empty
-        magnetic_names = []
-        for name in ["suck","toe","empty"]:
-            magnetic_names.extend([s for s in body_names if name in s])
-        self.magnetic_indices = torch.zeros(len(magnetic_names),dtype=torch.long,device=self.device,requires_grad=False)
-        for i,name in enumerate(magnetic_names):
-            self.magnetic_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0],self.actor_handles[0],name)
-        self.magnetic_indices = torch.sort(self.magnetic_indices)[0]
-        self.magnetic_indices = self.magnetic_indices.view(-1,3)
+        # Three bodies form one cup: [suck, toe, empty].  Use the same leg
+        # order as ExpertClimb and the asset body list, rather than relying on
+        # a global sort of names/handles.  This keeps adhesion commands, cup
+        # contact forces and the five-joint sensor block aligned by leg.
+        self.magnetic_leg_order = ["lb", "lf", "lm", "rb", "rf", "rm"]
+        magnetic_body_groups = [
+            [f"l_{leg}_{part}" for part in ("suck", "toe", "empty")]
+            for leg in self.magnetic_leg_order
+        ]
+        missing_magnetic_bodies = [
+            name for group in magnetic_body_groups for name in group
+            if name not in body_names
+        ]
+        if missing_magnetic_bodies:
+            raise RuntimeError(
+                f"magnetic bodies are missing from the asset: {missing_magnetic_bodies}"
+            )
+        self.magnetic_indices = torch.tensor(
+            [[self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], name)
+              for name in group]
+             for group in magnetic_body_groups],
+            dtype=torch.long, device=self.device, requires_grad=False,
+        )
         print("magnetic_indices\n",self.magnetic_indices)
+
+        if self.recording_sensors_enabled:
+            self.record_joint_parent_indices = torch.tensor(
+                [body_names.index(spec["parent"])
+                 for spec in self.record_joint_sensor_specs],
+                dtype=torch.long, device=self.device
+            )
+            self.record_joint_child_indices = torch.tensor(
+                [body_names.index(spec["child"])
+                 for spec in self.record_joint_sensor_specs],
+                dtype=torch.long, device=self.device
+            )
+            # Every magnetic group is explicitly [suck, toe, empty]; toe is
+            # the cup reference frame.
+            self.record_cup_reference_indices = self.magnetic_indices[:,1].clone()
 
     def _get_noise_scale_vec(self):
         noise_scalse = self.cfg.noise.noise_scales
@@ -500,7 +856,8 @@ class HexClimb(LeggedRobot):
         self.rb_forces[:,magnetic_indices,2] += adhesions_repeated*(self.cfg.control.suction_force_delt/3.0)
         self.rb_forces[:,magnetic_indices,2] *= contacts_filt_repeated.float()
         self.rb_forces = torch.clip(self.rb_forces,-self.cfg.control.suction_force_max/3.0,0.0)
-        print("robot contact force norm=",torch.norm(self.contact_forces[:,self.feet_indices,:],dim=-1))
+        if self.debug_viz:
+            print("robot contact force norm=",torch.norm(self.contact_forces[:,self.feet_indices,:],dim=-1))
         # print("rb_forces \n ",self.rb_forces[:,magnetic_indices,2].reshape(6,3))
         return self.rb_forces
     

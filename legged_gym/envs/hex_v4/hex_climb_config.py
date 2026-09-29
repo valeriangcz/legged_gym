@@ -10,6 +10,13 @@ class HexClimbCfg(LeggedRobotCfg):
         num_actions = 30
         episode_length_s=200
         env_spacing=2.0
+        # Recording-only switches.  They are off in training/play by default
+        # and are configured by scripts/record_expert_climb.py before env creation.
+        enable_recording_sensors = False
+        record_mass_scales = None
+        record_fixed_friction = None
+        visualize_gravity = False
+        gravity_visualization_length = 0.25
     class terrain(LeggedRobotCfg.terrain):
         # mesh_type = "trimesh"
         mesh_type = 'plane'
@@ -59,8 +66,8 @@ class HexClimbCfg(LeggedRobotCfg):
         # curriculum = True
         curriculum = False
         class ranges:
-            lin_vel_x=[-0.2,0.2]
-            lin_vel_y=[-0.3,0.3]
+            lin_vel_x=[-0.3,0.3]
+            lin_vel_y=[-0.4,0.4]
             ang_vel_yaw=[-0.5,0.5]            
     class init_state(LeggedRobotCfg.init_state):
         # pos = [1.6, 4.2, 0.12]
@@ -116,7 +123,7 @@ class HexClimbCfg(LeggedRobotCfg):
                     damping['j_'+t+'_'+qn] = 0.2                  
         action_scale=1.2
         decimation = 4
-        suction_force_delt=200 #每0.01s，释放时减少的力，吸附时吸力变化是其5倍
+        suction_force_delt=10 #每0.01s，释放时减少的力，吸附时吸力变化是其5倍
         suction_force_max=100.0 #300N是最电磁铁大吸附力
 
     class asset(LeggedRobotCfg.asset):

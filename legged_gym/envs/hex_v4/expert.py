@@ -58,7 +58,10 @@ class ExpertClimb:
         self.q_des_flat=self.q_des.view(env_nums*6,4)
         # 准静态支撑前馈：在机身 R 系分配接触力，再映射到腿局部
         # Jacobian。参数与 hex_climb.urdf 和 ExpertComplex 保持一致。
-        self.total_mass = 14.530042
+        # One value per environment keeps the batched static feedforward valid
+        # when a recording run uses parallel actors with different masses.
+        self.total_mass = torch.full((env_nums, 1), 14.530042,
+                                     dtype=torch.float32, device=device)
         # self.total_mass = 10.5     
         self.R_body_com = torch.tensor([0.0014417,0.043319,0.0041358],
                                        dtype=torch.float32,device=device)
@@ -98,8 +101,21 @@ class ExpertClimb:
         self.kin.ForwardKin(self.q_init.view(6,4),self.B_e_init)
 
         self._GetFootAngle(self.q_init.view(6,4).repeat(env_nums,1))
-        # self.q_des[:]=self.q_init
         self.B_e_des[:]=self.B_e_init.unsqueeze(0)
+
+    def set_total_mass(self, total_mass: torch.Tensor):
+        """Set one positive total mass (kg) for every parallel environment."""
+        masses = torch.as_tensor(total_mass, dtype=torch.float32,
+                                 device=self.device).reshape(-1)
+        if masses.numel() == 1:
+            masses = masses.repeat(self.env_nums)
+        if masses.numel() != self.env_nums:
+            raise ValueError(
+                f"total_mass must contain 1 or {self.env_nums} values, got {masses.numel()}"
+            )
+        if not torch.isfinite(masses).all() or torch.any(masses <= 0.0):
+            raise ValueError("total_mass values must be finite and positive")
+        self.total_mass = masses.view(self.env_nums, 1)
         
         # print("-------------initial B_e_des-------------\n",self.B_e_des)
 
@@ -487,7 +503,7 @@ class ExpertClimb:
         sub_z_mask=~self.gaits&(self.swing_reach_point)
 
         next_B_e_des[...,2][sub_z_mask]-=v_z[sub_z_mask]*self.dt
-        print("next_B_e_dex\n",next_B_e_des)
+        # print("next_B_e_dex\n",next_B_e_des)
         return next_B_e_des
 
     def _GetFootAngle(self,joint_pos:torch.Tensor):
