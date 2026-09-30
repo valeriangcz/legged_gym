@@ -2,11 +2,137 @@ from torch import sin,cos,acos,atan,atan2,asin,pi,sqrt
 import torch
 
 class Kinematic:
-    def __init__(self,l1,l2,l3,device='cpu'):
+    """Torch leg kinematics with optional batched whole-robot COM support."""
+
+    MASS_LEG_NAMES = ("lb", "lf", "lm", "rb", "rf", "rm")
+    MASS_LINK_NAMES = (
+        "thigh", "knee", "ankle", "foot", "ball1", "ball2", "suck", "toe", "empty",
+    )
+
+    def __init__(self,l1,l2,l3,device='cpu',body_x=0.1,body_y=0.22):
         self.l1=l1
         self.l2=l2
         self.l3=l3
         self.device=device
+        self.body_x=float(body_x)
+        self.body_y=float(body_y)
+        self._mass_model_configured = False
+
+    @staticmethod
+    def _translation(x, y, z, device, dtype):
+        out = torch.eye(4, device=device, dtype=dtype)
+        out[:3, 3] = torch.tensor((x, y, z), device=device, dtype=dtype)
+        return out
+
+    @staticmethod
+    def _rz(angles):
+        out = torch.zeros(*angles.shape, 4, 4, device=angles.device, dtype=angles.dtype)
+        out[..., 0, 0], out[..., 0, 1] = torch.cos(angles), -torch.sin(angles)
+        out[..., 1, 0], out[..., 1, 1] = torch.sin(angles), torch.cos(angles)
+        out[..., 2, 2], out[..., 3, 3] = 1.0, 1.0
+        return out
+
+    def configure_mass_model(self, body_names, body_masses, body_com_local):
+        """Cache final PhysX mass properties for batched dynamic COM queries."""
+        names = [name.decode() if isinstance(name, bytes) else str(name) for name in body_names]
+        expected = ["body"] + [
+            f"l_{leg}_{link}" for leg in self.MASS_LEG_NAMES for link in self.MASS_LINK_NAMES
+        ]
+        if len(names) != len(set(names)):
+            raise ValueError("body_names must not contain duplicates")
+        missing = [name for name in expected if name not in names]
+        unexpected = [name for name in names if name not in expected]
+        if missing or unexpected:
+            raise ValueError(
+                "mass model body names do not match the supported hex layout; "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+
+        masses = torch.as_tensor(body_masses, dtype=torch.float32, device=self.device)
+        local_com = torch.as_tensor(body_com_local, dtype=torch.float32, device=self.device)
+        if masses.ndim != 2 or masses.shape[1] != len(names):
+            raise ValueError(f"body_masses must have shape (env, {len(names)}), got {tuple(masses.shape)}")
+        if local_com.shape != (len(names), 3):
+            raise ValueError(f"body_com_local must have shape ({len(names)}, 3), got {tuple(local_com.shape)}")
+        if not torch.isfinite(masses).all() or torch.any(masses < 0.0):
+            raise ValueError("body_masses must be finite and non-negative")
+        if not torch.isfinite(local_com).all():
+            raise ValueError("body_com_local must be finite")
+        total_mass = masses.sum(dim=1, keepdim=True)
+        if torch.any(total_mass <= 0.0):
+            raise ValueError("every environment must have a positive total mass")
+
+        index = {name: i for i, name in enumerate(names)}
+        body_index = index["body"]
+        link_indices = torch.tensor(
+            [[index[f"l_{leg}_{link}"] for link in self.MASS_LINK_NAMES]
+             for leg in self.MASS_LEG_NAMES], dtype=torch.long, device=self.device,
+        )
+        flat_indices = link_indices.reshape(-1)
+        self._mass_body_mass = masses[:, body_index]
+        self._mass_link_masses = masses[:, flat_indices].view(masses.shape[0], 6, 9)
+        self._mass_total = total_mass
+        self._mass_body_com = local_com[body_index]
+        self._mass_link_com_h = torch.cat((
+            local_com[flat_indices].view(6, 9, 3),
+            torch.ones(6, 9, 1, device=self.device, dtype=masses.dtype),
+        ), dim=-1)
+
+        dtype = masses.dtype
+        base_xy = torch.tensor(
+            ((-self.body_x, -self.body_y), (-self.body_x, self.body_y), (-self.body_x, 0.0),
+             (self.body_x, -self.body_y), (self.body_x, self.body_y), (self.body_x, 0.0)),
+            device=self.device, dtype=dtype,
+        )
+        self._mass_b_to_r = torch.eye(4, device=self.device, dtype=dtype).repeat(6, 1, 1)
+        self._mass_b_to_r[:, :2, 3] = base_xy
+        self._mass_b_to_r[:3, 0, 0] = -1.0
+        self._mass_b_to_r[:3, 1, 1] = -1.0
+
+        # Cache all fixed chain terms.  ball1, ball2 and suck are deliberately
+        # evaluated at zero angle, as in ExpertComplex's mass model.
+        rx90 = torch.eye(4, device=self.device, dtype=dtype)
+        rx90[:3, :3] = torch.tensor(((1., 0., 0.), (0., 0., -1.), (0., 1., 0.)), device=self.device, dtype=dtype)
+        ry90 = torch.eye(4, device=self.device, dtype=dtype)
+        ry90[:3, :3] = torch.tensor(((0., 0., 1.), (0., 1., 0.), (-1., 0., 0.)), device=self.device, dtype=dtype)
+        self._mass_knee_prefix = self._translation(self.l1, 0., 0., self.device, dtype) @ rx90
+        self._mass_ankle_prefix = self._translation(self.l2, 0., 0., self.device, dtype)
+        self._mass_foot_prefix = self._translation(self.l3, 0., 0., self.device, dtype)
+        ball_prefix = self._translation(0.001, 0., 0., self.device, dtype)
+        self._mass_ball_prefix = ball_prefix
+        self._mass_suck_prefix = ball_prefix @ ry90
+        self._mass_toe_prefix = self._mass_suck_prefix @ self._translation(0., 0., 0.026, self.device, dtype)
+        self._mass_model_configured = True
+
+    def mass_properties(self, drive_joints):
+        """Return per-environment ``(total_mass_kg, R_com_m)`` for [env, 6, 4] q."""
+        if not self._mass_model_configured:
+            raise RuntimeError("configure_mass_model must be called before mass_properties")
+        joints = torch.as_tensor(drive_joints, dtype=torch.float32, device=self.device)
+        expected_shape = (self._mass_total.shape[0], 6, 4)
+        if tuple(joints.shape) != expected_shape:
+            raise ValueError(f"drive_joints must have shape {expected_shape}, got {tuple(joints.shape)}")
+        if not torch.isfinite(joints).all():
+            raise ValueError("drive_joints must be finite")
+
+        rz1, rz2, rz3, rz4 = (self._rz(joints[..., i]) for i in range(4))
+        to_thigh = self._mass_b_to_r.unsqueeze(0) @ rz1
+        to_knee = to_thigh @ self._mass_knee_prefix @ rz2
+        to_ankle = to_knee @ self._mass_ankle_prefix @ rz3
+        to_foot = to_ankle @ self._mass_foot_prefix @ rz4
+        to_ball = to_foot @ self._mass_ball_prefix
+        to_suck = to_foot @ self._mass_suck_prefix
+        to_toe = to_foot @ self._mass_toe_prefix
+        transforms = torch.stack(
+            (to_thigh, to_knee, to_ankle, to_foot, to_ball, to_ball, to_suck, to_toe, to_toe),
+            dim=2,
+        )
+        link_com_r = torch.matmul(
+            transforms[..., :3, :], self._mass_link_com_h.unsqueeze(0).unsqueeze(-1),
+        ).squeeze(-1)
+        weighted_links = (self._mass_link_masses.unsqueeze(-1) * link_com_r).sum(dim=(1, 2))
+        weighted_com = weighted_links + self._mass_body_mass.unsqueeze(-1) * self._mass_body_com
+        return self._mass_total, weighted_com / self._mass_total
 
     def ForwardKin(self,joints,pos:torch.Tensor):
         """joints:[batch_size,3],pos:[batch_size,3]"""

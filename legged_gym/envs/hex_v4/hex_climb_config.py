@@ -113,8 +113,8 @@ class HexClimbCfg(LeggedRobotCfg):
         for t in _tao:
             for qn in _q_name:
                 if qn in ['thigh','knee','ankle']:
-                    stiffness['j_'+t+'_' + qn]=100.0
-                    damping['j_'+t+'_'+qn] = 1.0
+                    stiffness['j_'+t+'_' + qn]=120.0
+                    damping['j_'+t+'_'+qn] = 1.2
                 elif qn == 'foot':
                     stiffness['j_'+t+'_' + qn]=20.0
                     damping['j_'+t+'_'+qn] = 0.3
@@ -123,15 +123,15 @@ class HexClimbCfg(LeggedRobotCfg):
                     damping['j_'+t+'_'+qn] = 0.2                  
         action_scale=1.2
         decimation = 4
-        suction_force_delt=10 #每0.01s，释放时减少的力，吸附时吸力变化是其5倍
-        suction_force_max=100.0 #300N是最电磁铁大吸附力
+        suction_force_delt=1 #每0.01s，释放时减少的力，吸附时吸力变化是其5倍
+        suction_force_max=10.0 #300N是最电磁铁大吸附力
 
     class asset(LeggedRobotCfg.asset):
         file=f"{LEGGED_GYM_ROOT_DIR}/resources/robots/hex_v4/urdf/hex_climb.urdf"
         name="hex_v4"
         foot_name="toe"
         penalize_contacts_on=["ankle","knee","thigh"]
-        terminate_after_contacts_on=["body"]
+        terminate_after_contacts_on=[""]
 
         #额外增加两个，一个是电机驱动的关节名称，一个是电机和舵机驱动的关节名称
         dof_motor_drive=["thigh","knee","ankle"]
@@ -162,6 +162,7 @@ class HexClimbCfg(LeggedRobotCfg):
         push_robots=False
         randomize_friction = True
         friction_range = [0.4,0.5]
+        randomize_base_mass=False
         # randomize_base_mass = True
         # added_mass_range = [-1., 1.]
 

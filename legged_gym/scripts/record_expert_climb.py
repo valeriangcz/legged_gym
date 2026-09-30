@@ -37,26 +37,27 @@ from legged_gym.utils.helpers import class_to_dict
 # ---------------------------------------------------------------------------
 # World gravity is R_x(angle) @ [0, 0, -GRAVITY_MAGNITUDE].  A positive 90 deg
 # angle therefore produces gravity along +Y in the world frame.
-GRAVITY_X_ANGLES_DEG: Tuple[float, ...] = (180.0,150.0,120.0,90.0,60.0,30.0,0.0)
-# (0.0,30.0 ,60.0 ,90.0 ,120.0, 150.0, 180.0)
+GRAVITY_X_ANGLES_DEG: Tuple[float, ...] = (0.0,60.0 ,90.0 ,120.0,180.0)
+
 GRAVITY_MAGNITUDE = 9.81  # m/s^2; set to 0.0 for the zero-gravity test.
 
 # One actor/environment is created for every item in this tuple.  They run in
 # parallel within each gravity/adsorption case.
-MASS_SCALES: Tuple[float, ...] = (0.5,0.6,0.7,0.8,0.9,1.0)
-SUCTION_FORCE_MAXES: Tuple[float, ...] = (300.0,)  # N per cup
-SUCTION_FORCE_DELTAS: Tuple[float, ...] = (30.0,)  # N per control update
+# 0.05,
+MASS_SCALES: Tuple[float, ...] = (0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0,)
+SUCTION_FORCE_MAXES: Tuple[float, ...] = (150.0,)  # N per cup
+SUCTION_FORCE_DELTAS: Tuple[float, ...] = (150.0,)  # N per control updat3
 
 FIXED_STATIC_FRICTION = 0.7
 FIXED_DYNAMIC_FRICTION = 0.7
 FIXED_ROBOT_SHAPE_FRICTION = 0.7
 
 TRANSITION_DURATION_S = 0.5
-RECORD_DURATION_S = 10.0
-SETTLE_DURATION_S = 1.0
+RECORD_DURATION_S = 5.0
+SETTLE_DURATION_S = 0.5
 H5_CHUNK_FRAMES = 400  # one second at the default 400 Hz physical-step rate
 RUN_LABEL = "mass_sweep"
-DATASET_VERSION = "expert_climb_h5_v1"
+DATASET_VERSION = "expert_climb_h5_v2"
 README_TEMPLATE_PATH = Path(__file__).with_name("record_expert_climb_README.md")
 
 
@@ -64,6 +65,7 @@ FIELD_DESCRIPTIONS: Dict[str, Tuple[str, str]] = {
     "joint_position": ("rad", "All URDF DOF positions; DOF order is stored in the group metadata."),
     "joint_velocity": ("rad/s", "All URDF DOF velocities in the same order as joint_position."),
     "actuator_torque": ("N m", "Torque actually submitted to PhysX after controller calculation and clipping."),
+    "feedforward_torque": ("N m", "Expert main-motor feedforward torque before it is added to position-control torque and before total actuator clipping; order is motor_dof_names."),
     "dof_generalized_force": ("N m", "Isaac Gym DOF force-sensor reading; includes generalized constraint effects."),
     "joint_sensor_wrench_world_raw": ("N, N m", "Raw force-sensor wrench in world axes at the child-link sensor origin."),
     "joint_sensor_origin_world": ("m", "World position of every joint force-sensor origin."),
@@ -289,12 +291,18 @@ def _record_case(h5_file, env, angle_deg: float, gravity: Sequence[float],
     group.attrs["wrench_order"] = "[Fx,Fy,Fz,Mx,My,Mz]"
 
     writer = H5CaseWriter(h5_file, group, env.num_envs, H5_CHUNK_FRAMES)
-    writer.write_static("mass_scales", np.asarray(MASS_SCALES, dtype=np.float32), unit="scale")
     writer.write_static("total_mass_kg", env.record_total_masses.detach().cpu().numpy(), unit="kg")
     writer.write_static("rigid_body_masses_kg", env.record_body_masses.detach().cpu().numpy(), unit="kg")
     writer.write_static("rigid_body_com_local_m", env.record_body_com_local.detach().cpu().numpy(), unit="m")
     writer.write_static("rigid_body_names", np.asarray(env.body_names, dtype=h5py.string_dtype()))
     writer.write_static("dof_names", np.asarray(env.dof_names, dtype=h5py.string_dtype()))
+    motor_dof_names = [
+        env.dof_names[index]
+        for index in env.dof_motor_drive_indices.detach().cpu().tolist()
+    ]
+    writer.write_static(
+        "motor_dof_names", np.asarray(motor_dof_names, dtype=h5py.string_dtype())
+    )
     writer.write_static("robot_shape_friction", _verify_friction(env), unit="coefficient")
     writer.write_static(
         "surface_friction",
@@ -427,6 +435,14 @@ def main() -> None:
             h5_file.attrs["dataset_version"] = DATASET_VERSION
             h5_file.attrs["wrench_order"] = "[Fx,Fy,Fz,Mx,My,Mz]"
             h5_file.attrs["mass_dimension"] = "MASS_SCALES order"
+            mass_scales = h5_file.create_dataset(
+                "mass_scales", data=np.asarray(MASS_SCALES, dtype=np.float32)
+            )
+            mass_scales.attrs["unit"] = "scale"
+            mass_scales.attrs["description"] = (
+                "Mass scale for every dynamic dataset's second dimension; "
+                "shared by all cases in this run."
+            )
             for angle_deg in GRAVITY_X_ANGLES_DEG:
                 gravity = _gravity_from_x_angle(float(angle_deg))
                 for suction_max in SUCTION_FORCE_MAXES:

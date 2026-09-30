@@ -20,8 +20,16 @@ class HexClimb(LeggedRobot):
         self.foot_traj_vis=False
         self.actuator = Actuator(self.cfg,self.device)
         self.expert = ExpertClimb(self.cfg,self.device,self.cfg.env.num_envs)
-        if getattr(self, "_record_mass_scaling_active", False):
-            self.expert.set_total_mass(self.record_total_masses)
+        self.expert.configure_mass_model(
+            self.body_names, self.actor_body_masses, self.actor_body_com_local,
+        )
+        # Keep the command that was used for the current control step separate
+        # from ``self.torques``. The latter also contains position-control
+        # torque and is clipped to the actuator limits.
+        self.recording_feedforward_torque = torch.zeros(
+            self.num_envs, len(self.dof_motor_drive_indices),
+            dtype=torch.float32, device=self.device,
+        )
         gravity_visualization_length = float(
             getattr(self.cfg.env, "gravity_visualization_length", 0.25)
         )
@@ -84,6 +92,15 @@ class HexClimb(LeggedRobot):
                             tau_ff:Optional[torch.Tensor]=None,
                             physics_step_callback:Optional[Callable[["HexClimb"],None]]=None):
         """执行共享的物理步进；q_des 为 None 时沿用缩放 action 接口。"""
+        # A callback runs once per physical step below. Snapshot the command
+        # once per control step so every sample gets the exact feedforward
+        # torque supplied for this control interval. Ordinary policy actions
+        # have no feedforward component.
+        if tau_ff is None:
+            self.recording_feedforward_torque.zero_()
+        else:
+            self.recording_feedforward_torque.copy_(tau_ff)
+
         # step physics and render each frame
         self.render()
 
@@ -162,8 +179,9 @@ class HexClimb(LeggedRobot):
         由于刚开始的时候，机器人是悬浮在空中，因此刚开始的几个时间步是没有足端接触地面的，因此只对episode_length_buf大于1s的进行reset
 
         结束条件：身体发生碰撞 | 所有足端与平面都不接触了(F<10N,为了避免估计误差) | 到规定时间"""
-        reset_collide = torch.any(torch.norm(self.contact_forces[:,self.termination_contact_indices,:],dim=-1)>1.0, dim=1)
-        reset_contact = torch.all(torch.norm(self.contact_forces[:,self.feet_indices,:],dim=-1)<10.0, dim=1)
+        # reset_collide = torch.any(torch.norm(self.contact_forces[:,self.termination_contact_indices,:],dim=-1)>1.0, dim=1)
+        reset_collide = False
+        reset_contact = torch.all(torch.norm(self.contact_forces[:,self.feet_indices,:],dim=-1)<1.0, dim=1)
         initial_condition = self.episode_length_buf > self.cfg.init_state.buffer_time/self.dt
         self.time_out_buf = self.episode_length_buf > self.max_episode_length
         
@@ -203,11 +221,12 @@ class HexClimb(LeggedRobot):
                                self.commands[:,2]],dim=1)
         q_cur = self.dof_pos[:,self.dof_motor_drive_indices].clone()
         q_dot_cur = self.dof_vel[:,self.dof_motor_drive_indices].clone()
+        q_drive_cur = self.dof_pos[:,self.dof_drive_indices].clone()
         adhesion_force = self.rb_forces[:,self.feet_indices,2].clone().abs()
         contact_force = self.contact_forces[:,self.feet_indices,2].clone().abs()
         gravity_R = self.projected_gravity*self.gravity_norm
         adhesions, q_des, tau_ff = self.expert.ProcessCommand(
-            command,q_cur,q_dot_cur,adhesion_force,contact_force,gravity_R
+            command,q_cur,q_dot_cur,q_drive_cur,adhesion_force,contact_force,gravity_R
         )
         return q_des.detach(), tau_ff.detach(), adhesions.detach()
 
@@ -524,6 +543,7 @@ class HexClimb(LeggedRobot):
             "joint_position": self.dof_pos,
             "joint_velocity": self.dof_vel,
             "actuator_torque": self.torques,
+            "feedforward_torque": self.recording_feedforward_torque,
             "dof_generalized_force": self.dof_force,
             "joint_sensor_wrench_world_raw": raw_wrench_world,
             "joint_sensor_origin_world": child_state[...,:3],
@@ -656,8 +676,8 @@ class HexClimb(LeggedRobot):
         env_upper = gymapi.Vec3(0., 0., 0.)
         self.actor_handles = []
         self.envs = []
-        recorded_masses = []
-        recorded_coms = None
+        actor_body_masses = []
+        actor_body_coms = None
         fixed_friction = getattr(self.cfg.env, "record_fixed_friction", None)
         if fixed_friction is not None:
             if not np.isfinite(fixed_friction) or fixed_friction < 0.0:
@@ -686,26 +706,32 @@ class HexClimb(LeggedRobot):
                 for body_prop in body_props:
                     body_prop.mass *= float(configured_mass_scales[i])
             self.gym.set_actor_rigid_body_properties(env_handle, actor_handle, body_props, recomputeInertia=True)
-            if self.recording_sensors_enabled or self._record_mass_scaling_active:
-                recorded_masses.append([body_prop.mass for body_prop in body_props])
-                if recorded_coms is None:
-                    recorded_coms = [
-                        [body_prop.com.x, body_prop.com.y, body_prop.com.z]
-                        for body_prop in body_props
-                    ]
+            # Store final actor properties for ExpertClimb even outside recording:
+            # they include domain randomization and any recording mass scale.
+            actor_body_masses.append([body_prop.mass for body_prop in body_props])
+            if actor_body_coms is None:
+                actor_body_coms = [
+                    [body_prop.com.x, body_prop.com.y, body_prop.com.z]
+                    for body_prop in body_props
+                ]
             if self.recording_sensors_enabled:
                 self.gym.enable_actor_dof_force_sensors(env_handle, actor_handle)
             self.envs.append(env_handle)
             self.actor_handles.append(actor_handle)
 
+        self.actor_body_masses = torch.tensor(
+            actor_body_masses, dtype=torch.float32, device=self.device
+        )
+        self.actor_body_com_local = torch.tensor(
+            actor_body_coms, dtype=torch.float32, device=self.device
+        )
+        self.actor_total_masses = self.actor_body_masses.sum(dim=1)
         if self.recording_sensors_enabled or self._record_mass_scaling_active:
-            self.record_body_masses = torch.tensor(
-                recorded_masses, dtype=torch.float32, device=self.device
-            )
-            self.record_body_com_local = torch.tensor(
-                recorded_coms, dtype=torch.float32, device=self.device
-            )
-            self.record_total_masses = self.record_body_masses.sum(dim=1)
+            # Keep the recording interface stable while sharing the exact same
+            # final PhysX properties with the expert mass model.
+            self.record_body_masses = self.actor_body_masses
+            self.record_body_com_local = self.actor_body_com_local
+            self.record_total_masses = self.actor_total_masses
 
         self.feet_indices = torch.zeros(len(feet_names), dtype=torch.long, device=self.device, requires_grad=False)
         for i in range(len(feet_names)):
@@ -858,7 +884,7 @@ class HexClimb(LeggedRobot):
         self.rb_forces = torch.clip(self.rb_forces,-self.cfg.control.suction_force_max/3.0,0.0)
         if self.debug_viz:
             print("robot contact force norm=",torch.norm(self.contact_forces[:,self.feet_indices,:],dim=-1))
-        # print("rb_forces \n ",self.rb_forces[:,magnetic_indices,2].reshape(6,3))
+        # print("rb_forces \n ",self.rb_forces[0,magnetic_indices,2].reshape(6,3))
         return self.rb_forces
     
     def reset_idx(self, env_ids):

@@ -12,19 +12,22 @@ logs/expert_climb/<run_id>/
 
 ## HDF5 layout
 
-`expert_climb.h5` contains one group per `gravity_x_angle × suction_max × suction_delta` case. Dynamic robot fields are in `data/` and use:
+`expert_climb.h5` stores the shared `mass_scales` dataset once at its root. It
+contains one group per `gravity_x_angle × suction_max × suction_delta` case.
+Dynamic robot fields are in `data/` and use:
 
 ```text
 [time, mass_scale, ...]
 ```
 
-`mass_scale` follows the group-level `mass_scales` dataset exactly. Wrenches use force-first order `[Fx, Fy, Fz, Mx, My, Mz]`.
+`mass_scale` follows the root-level `mass_scales` dataset exactly. Wrenches use force-first order `[Fx, Fy, Fz, Mx, My, Mz]`.
 
 ## Dynamic dataset dictionary
 
 - `joint_position` — rad; all URDF DOF positions. See group-level `dof_names` for ordering.
 - `joint_velocity` — rad/s; all URDF DOF velocities.
 - `actuator_torque` — N m; torque submitted to PhysX after controller calculation and clipping.
+- `feedforward_torque` — N m; expert main-motor feedforward torque before it is added to position-control torque and before total actuator clipping. See group-level `motor_dof_names` for ordering.
 - `dof_generalized_force` — N m; Isaac Gym DOF force-sensor reading, including generalized constraint effects.
 - `joint_sensor_wrench_world_raw` — N, N m; raw 6D sensor wrench in world axes at the child-link origin.
 - `joint_sensor_origin_world` — m; sensor origin in world coordinates.
@@ -43,7 +46,7 @@ logs/expert_climb/<run_id>/
 
 ## Static case metadata
 
-Every case group stores gravity, suction parameters, friction values, mass scales, final total and per-link masses, link local COM values, body/DOF names, sensor labels, cup labels and all command segments. HDF5 dataset attributes repeat units and short descriptions.
+Every case group stores gravity, suction parameters, friction values, final total and per-link masses, link local COM values, body/DOF names, `motor_dof_names`, sensor labels, cup labels and all command segments. HDF5 dataset attributes repeat units and short descriptions.
 
 `config_snapshot.yaml` is JSON-formatted YAML and records the script configuration. `run_metadata.json` records creation time, Git revision, URDF path, sampling rates and completed cases.
 

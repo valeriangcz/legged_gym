@@ -18,7 +18,9 @@ class ExpertClimb:
         
         self.kin=Kinematic(self.cfg.asset.links.l1,
                            self.cfg.asset.links.l2,
-                           self.cfg.asset.links.l3,device)
+                           self.cfg.asset.links.l3,device,
+                           self.cfg.asset.body_shape.x,
+                           self.cfg.asset.body_shape.y)
 
         # init curv variables for multi-env
         self.set_init_done=torch.zeros(env_nums,dtype=torch.bool,device=device)
@@ -56,15 +58,8 @@ class ExpertClimb:
         self.adhesions=torch.zeros(env_nums,6,dtype=torch.bool,device=device)
         self.q_des=torch.zeros(env_nums,6,4,dtype=torch.float32,device=device)
         self.q_des_flat=self.q_des.view(env_nums*6,4)
-        # 准静态支撑前馈：在机身 R 系分配接触力，再映射到腿局部
-        # Jacobian。参数与 hex_climb.urdf 和 ExpertComplex 保持一致。
-        # One value per environment keeps the batched static feedforward valid
-        # when a recording run uses parallel actors with different masses.
-        self.total_mass = torch.full((env_nums, 1), 14.530042,
-                                     dtype=torch.float32, device=device)
-        # self.total_mass = 10.5     
-        self.R_body_com = torch.tensor([0.0014417,0.043319,0.0041358],
-                                       dtype=torch.float32,device=device)
+        # The actual PhysX mass model is configured by HexClimb after actor
+        # creation.  It can differ for every parallel environment.
         self.motor_torque_limit = 27.0
         self.tau_ff = torch.zeros(env_nums,6,3,dtype=torch.float32,device=device)
         self.static_contact_forces_R = torch.zeros_like(self.tau_ff)
@@ -103,28 +98,16 @@ class ExpertClimb:
         self._GetFootAngle(self.q_init.view(6,4).repeat(env_nums,1))
         self.B_e_des[:]=self.B_e_init.unsqueeze(0)
 
-    def set_total_mass(self, total_mass: torch.Tensor):
-        """Set one positive total mass (kg) for every parallel environment."""
-        masses = torch.as_tensor(total_mass, dtype=torch.float32,
-                                 device=self.device).reshape(-1)
-        if masses.numel() == 1:
-            masses = masses.repeat(self.env_nums)
-        if masses.numel() != self.env_nums:
-            raise ValueError(
-                f"total_mass must contain 1 or {self.env_nums} values, got {masses.numel()}"
-            )
-        if not torch.isfinite(masses).all() or torch.any(masses <= 0.0):
-            raise ValueError("total_mass values must be finite and positive")
-        self.total_mass = masses.view(self.env_nums, 1)
-        
-        # print("-------------initial B_e_des-------------\n",self.B_e_des)
+    def configure_mass_model(self, body_names, body_masses, body_com_local):
+        """Use final per-actor PhysX properties for mass-aware feedforward."""
+        self.kin.configure_mass_model(body_names, body_masses, body_com_local)
 
     # def ResetJoint(self,env_indx:torch.Tensor):
     #     self.set_init_done[env_indx]=False
 
     def ProcessCommand(self,command:torch.Tensor,
                        q_cur:torch.Tensor,q_dot_cur:torch.Tensor,
-                       suction_forces:torch.Tensor,
+                       q_drive_cur:torch.Tensor,suction_forces:torch.Tensor,
                        contact_forces:torch.Tensor,
                        gravity_R:torch.Tensor)->Tuple[torch.Tensor,torch.Tensor,torch.Tensor]:
         """
@@ -169,7 +152,7 @@ class ExpertClimb:
             self.CalJointPoses(q_cur_flat,q_dot_cur_flat)
             # print("in expert suction_forces=",suction_forces)
 
-        self._ComputeQuasiStaticTauFF(q_cur_flat,gravity_R)
+        self._ComputeQuasiStaticTauFF(q_cur_flat,q_drive_cur,gravity_R)
         
         # print("in expert, self.adhesions.shape=",self.adhesions.shape)
         return (self.adhesions,
@@ -188,6 +171,7 @@ class ExpertClimb:
         ),dim=-2)
 
     def _ComputeQuasiStaticTauFF(self,q_cur_flat:torch.Tensor,
+                                 q_drive_cur:torch.Tensor,
                                  gravity_R:torch.Tensor)->torch.Tensor:
         """Compute and smooth stance-leg quasi-static motor feedforward torque.
 
@@ -203,10 +187,13 @@ class ExpertClimb:
             raise ValueError("gravity_R must be finite")
 
         q_cur = q_cur_flat.view(self.env_nums,6,3)
+        total_mass, R_com = self.kin.mass_properties(
+            q_drive_cur.view(self.env_nums,6,4)
+        )
         # _B2R includes the leg-root translations, which must be retained when
-        # constructing the moment arms about the body center of mass.
+        # constructing the moment arms about the current whole-robot COM.
         R_foot = self._B2R(self.B_e_cur)[...,:3]
-        r_R = R_foot-self.R_body_com.view(1,1,3)
+        r_R = R_foot-R_com.unsqueeze(1)
 
         # Allocate one 3-D contact-force block per leg. Inactive blocks remain
         # zero, which lets a single batched solve handle each gait grouping.
@@ -219,7 +206,7 @@ class ExpertClimb:
             A[:,:3,block] = eye.view(1,3,3)*active
             A[:,3:,block] = skew_r[:,leg]*active
 
-        b = torch.cat((-self.total_mass*gravity_R,
+        b = torch.cat((-total_mass*gravity_R,
                        torch.zeros(self.env_nums,3,dtype=torch.float32,device=self.device)),dim=1)
         normal = A@A.transpose(1,2)
         force_stack = A.transpose(1,2)@torch.linalg.pinv(normal)@b.unsqueeze(-1)
@@ -246,11 +233,15 @@ class ExpertClimb:
         target_tau = target_tau*self.gaits.unsqueeze(-1)
         target_tau = torch.clamp(target_tau,-self.motor_torque_limit,self.motor_torque_limit)
 
-        stance_changed = torch.any(self.gaits != self._tau_ff_stance_mask,dim=1)
+        #采用gaits和adhesions信号同时判断，对于哪些还在stance，但是准备释放的腿部也进行切换
+        support_mask = self.gaits & self.adhesions
+        # stance_changed = torch.any(self.gaits != self._tau_ff_stance_mask,dim=1)
+        stance_changed = torch.any(support_mask != self._tau_ff_stance_mask,dim=1)
         if stance_changed.any():
             self._tau_ff_transition_start[stance_changed] = self.tau_ff[stance_changed]
             self._tau_ff_transition_remaining[stance_changed] = self._tau_ff_transition_steps
-            self._tau_ff_stance_mask[stance_changed] = self.gaits[stance_changed]
+            # self._tau_ff_stance_mask[stance_changed] = self.gaits[stance_changed]
+            self._tau_ff_stance_mask[stance_changed] = support_mask[stance_changed]
 
         transition = self._tau_ff_transition_remaining > 0
         if transition.any():
@@ -401,9 +392,14 @@ class ExpertClimb:
 
     def CalJointPoses(self,q_cur_flat,q_dot_cur_flat):
         #damp_inv_jac_env: (env_nums*6)*3*3 q_cur_flat:(env_nums*6)*3
+
         damp_inv_jac_env=self.kin.DampInvJac(q_cur_flat) 
         pos_err=(self.B_e_des_flat[...,0:3]-self.B_e_cur_flat[...,0:3]).unsqueeze(-1) # (env_nums*6)*3*1
-        self.q_des_flat[:,0:3]=q_cur_flat+45*((damp_inv_jac_env@pos_err).squeeze(-1))*self.dt #-5.0*q_dot_cur_flat
+        self.q_des_flat[:,0:3]=q_cur_flat+75*((damp_inv_jac_env@pos_err).squeeze(-1))*self.dt #-5.0*q_dot_cur_flat
+
+        # self.q_des_flat[:,:3] = q_cur_flat
+        # self.kin.InverseKin2(self.B_e_des_flat[:,:3],self.q_des_flat[:,:3])
+        
         self._GetFootAngle(self.q_des_flat)
         # self._GetFootAngle(q_cur_flat)
         # self.B_e_des[...,3]=self.B_e_des[...,3]+(torch.rand_like(self.B_e_des[...,3])-0.5)
@@ -646,6 +642,8 @@ class ExpertGround(ExpertClimb):
         damp_inv_jac_env=self.kin.DampInvJac(q_cur_flat) 
         pos_err=(self.B_e_des_flat[...,0:3]-self.B_e_cur_flat[...,0:3]).unsqueeze(-1) # (env_nums*6)*3*1
         self.q_des_flat[:,0:3]=q_cur_flat+40*((damp_inv_jac_env@pos_err).squeeze(-1))*self.dt #-0.008*q_dot_cur_flat
+
+
 
     #没有吸附力了，需要重新定义步态切换规划方式
     def GaitPlanning(self, command,feet_contact_force):
