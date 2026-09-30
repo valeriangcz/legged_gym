@@ -112,6 +112,6 @@ sshfs art@100.81.118.15:/home/art/valerian_ws/legged_gym/logs-art /home/val/BIH_
 
 ###microbot git pull 错误与处理###
 ```
-env -u LD_LIBRARY_PATH git pull
+unset LD_LIBRARY_PATH
 export LD_LIBRARY_PATH="/home/val/miniconda3/envs/env_gym/lib:/opt/ros/humble/opt/rviz_ogre_vendor/lib:/opt/ros/humble/lib/x86_64-linux-gnu:/opt/ros/humble/lib"
 ```
