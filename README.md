@@ -108,3 +108,10 @@ The base environment `legged_robot` implements a rough terrain locomotion task. 
 
 ###将服务器上的log-art文件挂在的指令###
 sshfs art@100.81.118.15:/home/art/valerian_ws/legged_gym/logs-art /home/val/BIH_ws/legged_gym/logs-art
+
+
+###microbot git pull 错误与处理###
+```
+env -u LD_LIBRARY_PATH git pull
+export LD_LIBRARY_PATH="/home/val/miniconda3/envs/env_gym/lib:/opt/ros/humble/opt/rviz_ogre_vendor/lib:/opt/ros/humble/lib/x86_64-linux-gnu:/opt/ros/humble/lib"
+```

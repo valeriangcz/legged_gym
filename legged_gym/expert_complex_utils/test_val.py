@@ -1,7 +1,7 @@
 from legged_gym.expert_complex_utils import RoboVoxels,Kinematic,HexState
 import numpy as np
-
-
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 ro = RoboVoxels(Kinematic())
 ro.PlotRobotVoxels()
 
@@ -39,4 +39,20 @@ ro.PlotRobotVoxels()
 #         print(ang)
 #         print(vec)
 #         path_se3.append(SE3(t)*SE3.AngleAxis(ang,vec))
-        
+
+#绘制单位球面方向
+# theta = np.linspace(0,2*np.pi,16,endpoint=False)
+# phi = np.linspace(-np.pi/2.0,np.pi/2.0,16)
+# theta,phi = np.meshgrid(theta,phi)
+# #256, 3
+# s2_norm = np.column_stack([
+# np.cos(phi.ravel())*np.cos(theta.ravel()),
+# np.cos(phi.ravel())*np.sin(theta.ravel()),
+# np.sin(phi.ravel())
+#     ])
+# fig= plt.figure()
+# ax = fig.add_subplot(111,projection='3d')
+# ax.scatter(s2_norm[:,0],s2_norm[:,1],s2_norm[:,2])
+# plt.show()
+# # plt.plot(np.arange(0,1,0.01),np.logaddexp(0,np.arange(0,1,0.01)))
+# plt.show()

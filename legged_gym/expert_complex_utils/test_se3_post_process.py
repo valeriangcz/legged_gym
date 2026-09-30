@@ -78,6 +78,22 @@ class SE3PostProcessNumericalTest(unittest.TestCase):
         times,poses = post._SampleTrajectory(post.se3_ctrl_poses,21)
         self.assertLess(post._AccelerationMeanCost(poses,times),1e-20)
 
+    def test_near_orthogonal_rotation_skips_strict_log_check(self):
+        post = self._post_process_without_files()
+        nearly_rotated = SE3.Rz(0.2)
+        nearly_rotated.data[0][0,0] += 1e-14
+
+        with self.assertRaises(ValueError):
+            nearly_rotated.log(twist=True)
+
+        midpoint = post.Geodesic(SE3(),nearly_rotated,0.5)
+        self.assertTrue(np.isfinite(midpoint.A).all())
+        cost = post._AccelerationMeanCost(
+            [SE3(),nearly_rotated,SE3.Rz(0.4)],
+            np.array([0.0,1.0,2.0]),
+        )
+        self.assertTrue(np.isfinite(cost))
+
     def test_each_segment_has_fixed_sample_count_and_one_shared_join(self):
         post = self._post_process_without_files()
         post.GetCtrlPoes()

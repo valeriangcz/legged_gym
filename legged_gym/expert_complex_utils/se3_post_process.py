@@ -5,6 +5,7 @@ import json,os
 import numpy as np
 from datetime import datetime
 from spatialmath import SE3
+from spatialmath.base import trlog
 from math import radians,ceil
 from pathlib import Path
 from typing import List,Sequence
@@ -52,8 +53,8 @@ class PostProcess:
         self.vec_continuous_poses_index = [] #根据速度连续性条件得到的控制点在se3_ctrl_poses中的索引
         self.opt_cfg = opt_cfg
         self.hex_state = hex_state
-        self._check_length_interval = 0.05
-        self._check_rotate_interval = radians(10)
+        self._check_length_interval = 0.01
+        self._check_rotate_interval = radians(2)
 
         self.LoadJson(se3_path_file)
 
@@ -128,8 +129,8 @@ class PostProcess:
             T1 = self.se3_path_short[i]
             T2 = self.se3_path_short[i+1]
             self.se3_ctrl_poses.extend([T1,self.Geodesic(T1,T2,1/3),self.Geodesic(T1,T2,2/3),T2])
-            times1 = np.linalg.norm(T1.t-T2.t)/self.opt_cfg.v_max
-            times2 = T1.angdist(T2)/self.opt_cfg.omega_max
+            times1 = np.linalg.norm(T1.t-T2.t)/(self.opt_cfg.v_max*0.3)
+            times2 = T1.angdist(T2)/(self.opt_cfg.omega_max*0.3)
             self.se3_segment_times.append(max(times1,times2,1e-6))
         self.se3_segment_nums = len(self.se3_path_short)-1
         #T0, c0, c1, T1, f(c1), c2, T2, f(c2), c3, T3, ..... Tn-1, f(cn-1), cn, Tn
@@ -272,12 +273,14 @@ class PostProcess:
             dt_prev = sample_times[i]-sample_times[i-1]
             dt_next = sample_times[i+1]-sample_times[i]
             # 两个速度都表达在当前位姿的局部坐标系中。
+            relative_prev = sample_poses[i].inv()*sample_poses[i-1]
             velocity_prev = -np.asarray(
-                (sample_poses[i].inv()*sample_poses[i-1]).log(twist=True),
+                trlog(relative_prev.A,twist=True,check=False),
                 dtype=np.float64,
             )/dt_prev
+            relative_next = sample_poses[i].inv()*sample_poses[i+1]
             velocity_next = np.asarray(
-                (sample_poses[i].inv()*sample_poses[i+1]).log(twist=True),
+                trlog(relative_next.A,twist=True,check=False),
                 dtype=np.float64,
             )/dt_next
             acceleration = 2.0*(velocity_next-velocity_prev)/(dt_prev+dt_next)
@@ -546,7 +549,7 @@ class PostProcess:
         """
         SE3的螺旋测底线差值 u=[0,1]从0到1变化时 从T1变化到T2
         """
-        return T1 * SE3.Exp( u*(T1.inv()*T2).log() )
+        return T1 * SE3.Exp(u*trlog((T1.inv()*T2).A,check=False))
     def VecContinuous(self,ctrl1:SE3,T1:SE3,times1,times2)->SE3:
         """
         控制点排序为 ctrl1 T1 ctrl2 T1连接了两段 时间分别为times1和times2
@@ -679,20 +682,21 @@ if __name__ == "__main__":
     hex_state = HexState(Kinematic())
     # se3_initial_file = LEGGED_GYM_ROOT_DIR+"/legged_gym/expert_complex_utils/SE3_path/teleop_demo_20260707_221719.json"
     # se3_initial_file = LEGGED_GYM_ROOT_DIR+"/legged_gym/expert_complex_utils/SE3_path/teleop_demo_20260708_220712.json"
-    se3_initial_file = LEGGED_GYM_ROOT_DIR+"/legged_gym/expert_complex_utils/SE3_path/teleop_demo_20260928_174220.json"
+    se3_initial_file = LEGGED_GYM_ROOT_DIR+"/legged_gym/expert_complex_utils/SE3_path/teleop_demo_20260929_105051.json"
     post = PostProcess(se3_initial_file,hex_state,OptCfg())
     
-    # post.ShortCutPath()
-    post.se3_path_short.clear()
-    for se3 in post.se3_path:
-        post.se3_path_short.append(se3)
-    post.GetCtrlPoes()
-    out_dir = os.path.join(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path")
-    json_file = os.path.join(out_dir,
-                                 f"initial_se3_path_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+    post.ShortCutPath()
+    post.Optimize()
+
+    # post.se3_path_short.clear()
+    # for se3 in post.se3_path:
+    #     post.se3_path_short.append(se3)
+    # post.GetCtrlPoes()
+    # out_dir = os.path.join(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path")
+    # json_file = os.path.join(out_dir,
+    #                              f"initial_se3_path_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
         
-    post.WriteJson(json_file,dense_sample_dt=0.02)
-    # post.Optimize()
+    # post.WriteJson(json_file,dense_sample_dt=0.02)
     # axises= np.random.random((2,3))
     # axises = axises/np.linalg.norm(axises,axis=1,keepdims=True)
     # T1 = SE3.AngleAxis(1.3,axises[0])*SE3(np.random.random((3,)))
