@@ -4,9 +4,10 @@ from __future__ import annotations
 import json,os
 import numpy as np
 from datetime import datetime
+from dataclasses import dataclass
 from spatialmath import SE3
 from spatialmath.base import trlog
-from math import radians,ceil
+from math import radians
 from pathlib import Path
 from typing import List,Sequence
 from legged_gym import LEGGED_GYM_ROOT_DIR
@@ -16,30 +17,49 @@ class OptCfg:
     # optimize_all = False #False/True 路标点是否可以被优化
     optimize_all = True #False/True 路标点是否可以被优化
     #李代数更新范围限制，值并不代表真实的位移距离，可以作为反馈
-    delt_rho_limit=0.02 #平移对应范围限制
-    delt_fai_limit=0.1 #旋转对应范围限制
+    delt_rho_limit=0.04 #平移对应范围限制
+    delt_fai_limit=0.2 #旋转对应范围限制
     v_max = 0.1
     omega_max = 0.2
     max_retraction_iterations = 10
     cost_abs_change_tol = 1e-4
     cost_rel_change_tol = 1e-3
-    # 每段贝塞尔曲线固定采样：困难区域保留的路标段更多，因而自然获得更密采样。
-    # RobotFeasiCost很昂贵，使用较少点数；加速度和硬校验单独密采样。
-    samples_per_segment = 5
-    acceleration_samples_per_segment = 21
-    validation_samples_per_segment = 41
+    # 预采样只用于建立距离表；正式采样按平移/旋转李代数间隔生成。
+    sampling_rho_interval = 0.01
+    sampling_phi_interval = radians(2)
+    presample_count = 201
     fd_rho_step = 0.001
     fd_fai_step = 0.002
-    smooth_aggregation_temperature = 0.05
     acceleration_weight = 0.1
     speed_limit_tolerance = 1.0
     cost_progress_interval = 10
     # 每次retraction只做少量L-BFGS迭代，再在新的切空间重新线性化。
     optimizer_max_iterations = 2
     optimizer_max_function_evaluations = 64
+    # CMA-ES每次retraction的采样配置和代数上限。
+    cma_sigma0 = 0.3
+    cma_population_size = None
+    cma_max_generations = 20
+    cma_seed = 42
+    cma_retraction_patience = 3
 
 
     
+
+@dataclass(frozen=True)
+class TrajectorySampleGrid:
+    """一轮优化共用的采样参数，不缓存会随控制点变化的位姿。"""
+    times: np.ndarray
+    segment_indices: np.ndarray
+    u_values: np.ndarray
+
+    def __post_init__(self):
+        for name,dtype in (("times",np.float64),("segment_indices",np.int64),
+                           ("u_values",np.float64)):
+            values = np.array(getattr(self,name),dtype=dtype,copy=True)
+            values.setflags(write=False)
+            object.__setattr__(self,name,values)
+
 
 class PostProcess:
     def __init__(self,se3_path_file:str,hex_state:HexState,opt_cfg:OptCfg):
@@ -53,8 +73,6 @@ class PostProcess:
         self.vec_continuous_poses_index = [] #根据速度连续性条件得到的控制点在se3_ctrl_poses中的索引
         self.opt_cfg = opt_cfg
         self.hex_state = hex_state
-        self._check_length_interval = 0.01
-        self._check_rotate_interval = radians(2)
 
         self.LoadJson(se3_path_file)
 
@@ -86,13 +104,13 @@ class PostProcess:
             for end_index in range(len(self.se3_path)-1,start_index,-1):
                 print(f"checking path between index {start_index} and {end_index}")
                 T2 = self.se3_path[end_index]
-                len_dist_num = ceil(np.linalg.norm(T1.t-T2.t)/self._check_length_interval)
-                rot_dist_num = ceil(T1.angdist(T2)/self._check_rotate_interval)
-                check_num = max(len_dist_num,rot_dist_num)
-                # print("check_num=",check_num)
+                self._CheckSamplingConfig()
+                dense_u = np.linspace(0.0,1.0,self.opt_cfg.presample_count)
+                dense_poses = [T1.interp(T2,float(u)) for u in dense_u]
+                u_samples = self._DistanceSampleTimes(dense_u,dense_poses,[0.0,1.0])
                 interp_feasi = True
-                for i in range(check_num-1):
-                    T = T1.interp(T2,(i+1)/check_num)
+                for u in u_samples:
+                    T = T1.interp(T2,float(u))
                     _,_,body_cf_mask,leg_mask = self.hex_state.RobotFeasiCheck(T)
                     landing_counts = leg_mask.any(axis=-1).sum(axis=-1)
                     if body_cf_mask.all() and ((landing_counts>=3).all()):
@@ -217,33 +235,122 @@ class PostProcess:
             return updated_se3_ctrl_poses
 
 
-    def _SampleTrajectory(
-        self,
-        ctrl_poses:Sequence[SE3],
-        samples_per_segment:int,
-    )->tuple[np.ndarray,List[SE3]]:
-        """每段固定采样点数，同时保留真实时间戳；连接点只保留一次。"""
+    def _CheckSamplingConfig(self):
+        for name in ("sampling_rho_interval","sampling_phi_interval"):
+            value = getattr(self.opt_cfg,name)
+            if isinstance(value,(bool,np.bool_)) or not np.isfinite(value) or value<=0.0:
+                raise ValueError(f"{name} must be finite and positive")
+        count = self.opt_cfg.presample_count
         if (
-            isinstance(samples_per_segment,(bool,np.bool_))
-            or not isinstance(samples_per_segment,(int,np.integer))
-            or samples_per_segment<3
+            isinstance(count,(bool,np.bool_))
+            or not isinstance(count,(int,np.integer)) or count<3
         ):
-            raise ValueError("samples_per_segment must be an integer of at least 3")
-        if len(ctrl_poses)!=4*self.se3_segment_nums:
+            raise ValueError("presample_count must be an integer of at least 3")
+
+    def _SegmentTimes(self,ctrl_poses:Sequence[SE3])->np.ndarray:
+        if self.se3_segment_nums<=0 or len(ctrl_poses)!=4*self.se3_segment_nums:
             raise ValueError("ctrl_poses does not match segment count")
-        sample_times:List[float] = []
-        sample_poses:List[SE3] = []
+        durations = np.asarray(self.se3_segment_times,dtype=np.float64)
+        if (durations.shape!=(self.se3_segment_nums,)
+            or not np.isfinite(durations).all() or np.any(durations<=0.0)):
+            raise ValueError("Bezier segment times must be finite and positive")
+        if not all(np.isfinite(pose.A).all() for pose in ctrl_poses):
+            raise ValueError("integration input contains non-finite values")
+        return durations
+
+    def _DistanceSampleTimes(self,dense_times,dense_poses,mandatory_times)->np.ndarray:
+        """累计归一化 body twist 距离，再在非静止区间线性反查时间。"""
+        self._CheckSamplingConfig()
+        dense_times = np.asarray(dense_times,dtype=np.float64)
+        delta = np.asarray([
+            trlog((first.inv()*second).A,twist=True,check=False)
+            for first,second in zip(dense_poses[:-1],dense_poses[1:])
+        ],dtype=np.float64)
+        if not np.isfinite(delta).all():
+            raise ValueError("integration input contains non-finite values")
+        dq = np.maximum(
+            np.linalg.norm(delta[:,:3],axis=1)/self.opt_cfg.sampling_rho_interval,
+            np.linalg.norm(delta[:,3:],axis=1)/self.opt_cfg.sampling_phi_interval,
+        )
+        # 数值静止区间形成平台；不让零分母参与反查。
+        dq[dq<=1e-12] = 0.0
+        q = np.r_[0.0,np.cumsum(dq)]
+        targets = np.arange(0.0,q[-1],1.0)
+        targets = targets[targets<q[-1]-1e-10]
+        times = list(mandatory_times)
+        if targets.size:
+            left = np.searchsorted(q,targets,side="right")-1
+            fraction = (targets-q[left])/dq[left]
+            times.extend(dense_times[left]+fraction*np.diff(dense_times)[left])
+        # 连续平台只保留起止与中点，保留静止时长及其两端的速度变化。
+        changes = np.diff(np.r_[False,dq==0.0,False].astype(np.int8))
+        for first,last in zip(np.flatnonzero(changes==1),np.flatnonzero(changes==-1)):
+            times.extend([dense_times[first],
+                          (dense_times[first]+dense_times[last])/2.0,dense_times[last]])
+        mandatory = np.asarray(mandatory_times,dtype=np.float64)
+        tolerance = 32*np.finfo(np.float64).eps*max(1.0,float(dense_times[-1]))
+        # 优先保留准确的端点/连接时间，避免浮点误差产生极短时间间隔。
+        extras = [t for t in times if np.min(np.abs(mandatory-t))>tolerance]
+        result = np.sort(np.r_[mandatory,extras])
+        result = result[np.r_[True,np.diff(result)>tolerance]]
+        if result.size<3:
+            result = np.sort(np.r_[result,(dense_times[0]+dense_times[-1])/2.0])
+        return result
+
+    def _BuildTrajectorySampleGrid(self,ctrl_poses:Sequence[SE3])->TrajectorySampleGrid:
+        """每段均匀预采样后，在整条轨迹上连续累计距离，不在连接处归零。"""
+        self._CheckSamplingConfig()
+        durations = self._SegmentTimes(ctrl_poses)
+        dense_times,dense_poses = [],[]
         elapsed = 0.0
-        for segment_index,segment_time in enumerate(self.se3_segment_times):
-            u_samples = np.linspace(0.0,1.0,samples_per_segment)
+        for segment_index,duration in enumerate(durations):
+            u_samples = np.linspace(0.0,1.0,self.opt_cfg.presample_count)
             if segment_index>0:
                 u_samples = u_samples[1:]
             segment_ctrl = ctrl_poses[4*segment_index:4*segment_index+4]
             for u in u_samples:
-                sample_times.append(elapsed+float(u)*segment_time)
-                sample_poses.append(self.Bezier(segment_ctrl,float(u)))
-            elapsed += segment_time
-        return np.asarray(sample_times,dtype=np.float64),sample_poses
+                dense_times.append(elapsed+float(u)*duration)
+                dense_poses.append(self.Bezier(segment_ctrl,float(u)))
+            elapsed += duration
+        ends = np.cumsum(durations)
+        times = self._DistanceSampleTimes(dense_times,dense_poses,np.r_[0.0,ends])
+        segments = np.minimum(np.searchsorted(ends,times,side="right"),len(durations)-1)
+        starts = np.r_[0.0,ends[:-1]]
+        u_values = np.clip((times-starts[segments])/durations[segments],0.0,1.0)
+        return TrajectorySampleGrid(times,segments,u_values)
+
+    def _SampleTrajectory(
+        self,ctrl_poses:Sequence[SE3],sample_grid:TrajectorySampleGrid|None=None,
+    )->tuple[np.ndarray,List[SE3]]:
+        """建表或复用固定参数网格，在当前控制点上重新求值。"""
+        durations = self._SegmentTimes(ctrl_poses)
+        if sample_grid is None:
+            sample_grid = self._BuildTrajectorySampleGrid(ctrl_poses)
+        if not isinstance(sample_grid,TrajectorySampleGrid):
+            raise TypeError("sample_grid must be a TrajectorySampleGrid")
+        times,indices,u = sample_grid.times,sample_grid.segment_indices,sample_grid.u_values
+        if (times.ndim!=1 or indices.shape!=times.shape or u.shape!=times.shape
+            or times.size<3 or not np.isfinite(times).all() or not np.isfinite(u).all()
+            or np.any(np.diff(times)<=0.0) or np.any(indices<0)
+            or np.any(indices>=len(durations)) or np.any(u<0.0) or np.any(u>1.0)):
+            raise ValueError("invalid trajectory sample grid")
+        starts = np.r_[0.0,np.cumsum(durations)[:-1]]
+        if (times[0]!=0.0 or not np.isclose(times[-1],sum(durations))
+            or not np.allclose(times,starts[indices]+u*durations[indices],rtol=0,atol=1e-12)):
+            raise ValueError("sample grid does not match segment times")
+        poses = [self.Bezier(ctrl_poses[4*i:4*i+4],float(parameter))
+                 for i,parameter in zip(indices,u)]
+        return times,poses
+
+    @staticmethod
+    def _SamplingDiagnostics(poses:Sequence[SE3])->dict:
+        delta = np.asarray([trlog((a.inv()*b).A,twist=True,check=False)
+                            for a,b in zip(poses[:-1],poses[1:])])
+        return {
+            "sample_count":len(poses),
+            "max_rho_step":float(np.max(np.linalg.norm(delta[:,:3],axis=1),initial=0.0)),
+            "max_phi_step":float(np.max(np.linalg.norm(delta[:,3:],axis=1),initial=0.0)),
+        }
 
     @staticmethod
     def _TimeAverage(values:np.ndarray,times:np.ndarray)->float:
@@ -297,33 +404,21 @@ class PostProcess:
         self,
         ctrl_poses:Sequence[SE3],
         candidate_indices:Sequence[np.ndarray],
+        sample_grid:TrajectorySampleGrid,
     )->tuple[float,float,float]:
-        sample_times,sample_poses = self._SampleTrajectory(
-            ctrl_poses,self.opt_cfg.samples_per_segment
-        )
+        sample_times,sample_poses = self._SampleTrajectory(ctrl_poses,sample_grid)
         if len(candidate_indices)!=len(sample_poses):
             raise ValueError("candidate_indices does not match trajectory samples")
         feasibility_values = np.asarray([
             self.hex_state.RobotFeasiCost(
                 pose,
                 points_idx=indices,
-                smooth_temperature=self.opt_cfg.smooth_aggregation_temperature,
             )
             for pose,indices in zip(sample_poses,candidate_indices)
         ],dtype=np.float64)
         feasibility_cost = self._TimeAverage(feasibility_values,sample_times)
-        if (
-            self.opt_cfg.acceleration_samples_per_segment
-            ==self.opt_cfg.samples_per_segment
-        ):
-            acceleration_times = sample_times
-            acceleration_poses = sample_poses
-        else:
-            acceleration_times,acceleration_poses = self._SampleTrajectory(
-                ctrl_poses,self.opt_cfg.acceleration_samples_per_segment
-            )
         acceleration_cost = self._AccelerationMeanCost(
-            acceleration_poses,acceleration_times
+            sample_poses,sample_times
         )
         total_cost = (
             feasibility_cost+self.opt_cfg.acceleration_weight*acceleration_cost
@@ -333,16 +428,21 @@ class PostProcess:
     def _ValidateTrajectory(
         self,
         ctrl_poses:Sequence[SE3],
+        sample_grid:TrajectorySampleGrid|None=None,
     )->tuple[bool,dict]:
         """以硬判定复核碰撞、落脚候选数和采样速度。"""
-        sample_times,sample_poses = self._SampleTrajectory(
-            ctrl_poses,self.opt_cfg.validation_samples_per_segment
-        )
+        sample_times,sample_poses = self._SampleTrajectory(ctrl_poses,sample_grid)
         invalid_sample_count = 0
+        invalid_body_count = 0
+        invalid_leg_count = 0
         for pose in sample_poses:
             _,_,body_mask,leg_mask = self.hex_state.RobotFeasiCheck(pose)
             landing_counts = leg_mask.any(axis=-1).sum(axis=-1)
-            if not (body_mask.all() and (landing_counts>=3).all()):
+            if not body_mask.all():
+                invalid_body_count += 1
+            if (landing_counts<3).any():
+                invalid_leg_count += 1
+            if (not body_mask.all()) or ((landing_counts<3).any()):
                 invalid_sample_count += 1
         dt = np.diff(sample_times)
         linear_speed = np.asarray([
@@ -362,12 +462,40 @@ class PostProcess:
         )
         diagnostics = {
             "invalid_sample_count":invalid_sample_count,
-            "sample_count":len(sample_poses),
+            "invalid_leg_count":invalid_leg_count,
+            "invalid_body_count":invalid_body_count,
+            **self._SamplingDiagnostics(sample_poses),
             "max_linear_speed":max_linear_speed,
             "max_angular_speed":max_angular_speed,
             "speed_valid":speed_valid,
         }
         return invalid_sample_count==0 and speed_valid,diagnostics
+
+    def _SelectFinalTrajectory(self,initial_ctrl_poses,valid_snapshots,optimizer_name):
+        """用各候选自己的新网格复验，从最近快照向前回滚。"""
+        candidates = [self.se3_ctrl_poses]+list(reversed(valid_snapshots))+[initial_ctrl_poses]
+        seen = set()
+        diagnostics = None
+        for candidate in candidates:
+            key = np.asarray([pose.A for pose in candidate]).tobytes()
+            if key in seen:
+                continue
+            seen.add(key)
+            grid = self._BuildTrajectorySampleGrid(candidate)
+            valid,diagnostics = self._ValidateTrajectory(candidate,grid)
+            if valid:
+                rolled_back = candidate is not candidates[0]
+                self.se3_ctrl_poses = [pose.copy() for pose in candidate]
+                self.se3_opt_poses = [self.se3_ctrl_poses[i] for i in self.opt_poses_index]
+                if rolled_back:
+                    print(f"{optimizer_name}: rolled back to a trajectory passing fresh-grid validation")
+                return grid,diagnostics,rolled_back
+        self.se3_ctrl_poses = [pose.copy() for pose in initial_ctrl_poses]
+        self.se3_opt_poses = [self.se3_ctrl_poses[i] for i in self.opt_poses_index]
+        raise RuntimeError(
+            f"{optimizer_name} produced no hard-feasible trajectory; restored the initial "
+            f"controls. Fresh-grid validation={diagnostics}"
+        )
 
     def Optimize(self):
         """
@@ -394,14 +522,12 @@ class PostProcess:
         )
 
         initial_ctrl_poses = self.se3_ctrl_poses.copy()
-        initial_valid,initial_diagnostics = self._ValidateTrajectory(initial_ctrl_poses)
-        best_valid_ctrl_poses = initial_ctrl_poses.copy() if initial_valid else None
+        initial_valid,_ = self._ValidateTrajectory(initial_ctrl_poses)
+        valid_snapshots = [initial_ctrl_poses.copy()] if initial_valid else []
         last_result:OptimizeResult|None = None
-        last_feasi_iteration = -1
         for iteration in range(self.opt_cfg.max_retraction_iterations):
-            _,base_sample_poses = self._SampleTrajectory(
-                self.se3_ctrl_poses,self.opt_cfg.samples_per_segment
-            )
+            sample_grid = self._BuildTrajectorySampleGrid(self.se3_ctrl_poses)
+            _,base_sample_poses = self._SampleTrajectory(self.se3_ctrl_poses,sample_grid)
             # 此列表在本次minimize期间保持不变，到下一次retraction才更新。
             candidate_indices = [
                 self.hex_state.GetRobotFeasiCostPoints(pose)
@@ -410,7 +536,8 @@ class PostProcess:
             cost_evaluation_count = 0
             print(
                 f"Retraction {iteration+1}: {len(base_sample_poses)} feasibility "
-                f"samples, {opt_poses_num*6} optimization variables",
+                f"samples, {opt_poses_num*6} optimization variables, "
+                f"sampling={self._SamplingDiagnostics(base_sample_poses)}",
                 flush=True,
             )
 
@@ -423,7 +550,7 @@ class PostProcess:
                     variables.reshape(-1,6),update_original=False
                 )
                 total_cost,_,_ = self._TrajectoryMeanCost(
-                    updated_ctrl_poses,candidate_indices
+                    updated_ctrl_poses,candidate_indices,sample_grid
                 )
                 cost_evaluation_count += 1
                 if (
@@ -438,7 +565,7 @@ class PostProcess:
                 return total_cost
 
             base_cost,base_feasibility,base_acceleration = self._TrajectoryMeanCost(
-                self.se3_ctrl_poses,candidate_indices
+                self.se3_ctrl_poses,candidate_indices,sample_grid
             )
             if iteration==0:
                 print(
@@ -486,7 +613,7 @@ class PostProcess:
             candidate_ctrl_poses = self.UpdateCtrlPoses(
                 res.x.reshape(-1,6),update_original=False
             )
-            candidate_valid,diagnostics = self._ValidateTrajectory(candidate_ctrl_poses)
+            candidate_valid,diagnostics = self._ValidateTrajectory(candidate_ctrl_poses,sample_grid)
             #优化过程可能出现不可行的结果，先取用，可能在后续优化中会变成可行
             self.se3_ctrl_poses = candidate_ctrl_poses
             self.se3_opt_poses = [
@@ -494,8 +621,7 @@ class PostProcess:
             ]
 
             if candidate_valid:
-                best_valid_ctrl_poses = candidate_ctrl_poses.copy()
-                last_feasi_iteration = iteration
+                valid_snapshots.append(candidate_ctrl_poses.copy())
                 print(f"iterations {iteration} success")
 
             cost_change = abs(base_cost-candidate_cost)
@@ -516,35 +642,228 @@ class PostProcess:
                     print(f"L-BFGS-B stopped: {res.message}")
                     break
 
-        final_valid,final_diagnostics = self._ValidateTrajectory(self.se3_ctrl_poses)
-        if not final_valid:
-            if best_valid_ctrl_poses is None:
-                self.se3_ctrl_poses = initial_ctrl_poses
-                self.se3_opt_poses = [
-                    self.se3_ctrl_poses[index] for index in self.opt_poses_index
-                ]
-                raise RuntimeError(
-                    "Optimization produced no hard-feasible trajectory; restored "
-                    f"the initial controls. Initial validation={initial_diagnostics}, "
-                    f"final validation={final_diagnostics}"
-                )
-            self.se3_ctrl_poses = best_valid_ctrl_poses
-            self.se3_opt_poses = [
-                self.se3_ctrl_poses[index] for index in self.opt_poses_index
-            ]
-            print(
-                f"Final candidate failed hard validation; rolled back to the {last_feasi_iteration+1} "
-                "th times iterations hard-feasible controls"
-            )
+        final_grid,final_diagnostics,rolled_back = self._SelectFinalTrajectory(
+            initial_ctrl_poses,valid_snapshots,"Optimization"
+        )
+        _,final_poses = self._SampleTrajectory(self.se3_ctrl_poses,final_grid)
+        final_indices = [self.hex_state.GetRobotFeasiCostPoints(pose) for pose in final_poses]
+        final_cost,feasibility_cost,acceleration_cost = self._TrajectoryMeanCost(
+            self.se3_ctrl_poses,final_indices,final_grid
+        )
+        if last_result is None:
+            last_result = OptimizeResult(x=initial_variables,success=True,message="No local iterations")
+        last_result.fun = final_cost
+        last_result.validation = final_diagnostics
+        last_result.rolled_back = rolled_back
+        last_result.feasibility_cost = feasibility_cost
+        last_result.acceleration_cost = acceleration_cost
+        print(f"Final time-mean cost={final_cost}, validation={final_diagnostics}")
         print("Optimize get optimized SE3 poses")
         out_dir = os.path.join(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path")
 
         json_file = os.path.join(out_dir,
                                  f"optimized_se3_path_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
         
-        self.WriteJson(json_file,dense_sample_dt=0.1)
+        last_result.output_path = self.WriteJson(json_file,sample_grid=final_grid)
         return last_result
     
+    def Optimize_CMA_ES(self)->OptimizeResult:
+        """串行CMA-ES优化；调用前需准备好se3_path_short。
+
+        在每次retraction的固定切空间中运行多代有界采样，使用实际评估
+        过的最佳候选更新轨迹，并保存通过当前硬校验的结果供最终回滚。
+        返回的x是最终自由控制点相对初始控制点的累计右扰动（物理单位），
+        不受单次retraction的边界限制。success表示最终轨迹通过硬校验，
+        而非CMA-ES是否耗尽预算；nfev包含基准和最终重新评估的软代价，
+        不包含硬校验。原有Optimize不依赖cma。
+        """
+        try:
+            import cma
+        except ImportError as exc:
+            raise ImportError(
+                "Optimize_CMA_ES requires pycma; install it with `pip install cma`."
+            ) from exc
+
+        cfg = self.opt_cfg
+
+        self.GetCtrlPoes()
+        dimension = 6*len(self.opt_poses_index)
+        population_size = (
+            int(4+3*np.log(dimension)) if cfg.cma_population_size is None
+            else int(cfg.cma_population_size)
+        )
+        scales = np.tile(
+            [cfg.delt_rho_limit]*3+[cfg.delt_fai_limit]*3,
+            len(self.opt_poses_index),
+        )
+        initial_ctrl_poses = self.se3_ctrl_poses.copy()
+        initial_valid,_ = self._ValidateTrajectory(initial_ctrl_poses)
+        valid_snapshots = [initial_ctrl_poses.copy()] if initial_valid else []
+        total_evaluations = 0
+        total_generations = 0
+        stagnation_count = 0
+        stop_message = "Retraction budget reached"
+        local_stop_message = ""
+
+        def TrajectoryCost(ctrl_poses,indices,grid):
+            try:
+                return self._TrajectoryMeanCost(ctrl_poses,indices,grid)
+            except ValueError as exc:
+                # 现有积分器拒绝NaN/Inf；仅把这类明确的数值失败视为无效
+                # 候选，形状、配置等其他错误仍向调用者报告。
+                if str(exc)!="integration input contains non-finite values":
+                    raise
+                return np.inf,np.inf,np.inf
+
+        for iteration in range(cfg.max_retraction_iterations):
+            sample_grid = self._BuildTrajectorySampleGrid(self.se3_ctrl_poses)
+            _,base_sample_poses = self._SampleTrajectory(self.se3_ctrl_poses,sample_grid)
+            candidate_indices = [
+                self.hex_state.GetRobotFeasiCostPoints(pose)
+                for pose in base_sample_poses
+            ]
+            def Evaluate(ctrl_poses:Sequence[SE3])->float:
+                nonlocal total_evaluations
+                cost,_,_ = TrajectoryCost(ctrl_poses,candidate_indices,sample_grid)
+                total_evaluations += 1
+                if (
+                    cfg.cost_progress_interval>0
+                    and total_evaluations%cfg.cost_progress_interval==0
+                ):
+                    print(
+                        f"  CMA-ES cost evaluations={total_evaluations}, "
+                        f"latest cost={cost}",flush=True,
+                    )
+                return float(cost) if np.isfinite(cost) else np.inf
+
+            base_cost = Evaluate(self.se3_ctrl_poses)
+            best_cost = base_cost
+            best_ctrl_poses = self.se3_ctrl_poses.copy()
+            # 使用局部随机数生成器，避免pycma重置调用者的NumPy随机状态。
+            seed = None if cfg.cma_seed is None else int(cfg.cma_seed)+iteration
+            rng = np.random.default_rng(seed)
+            es = cma.CMAEvolutionStrategy(
+                np.zeros(dimension),cfg.cma_sigma0,
+                {
+                    "bounds":[-1.0,1.0],
+                    "popsize":population_size,
+                    "maxiter":int(cfg.cma_max_generations),
+                    "seed":np.nan,
+                    "randn":lambda *shape: rng.standard_normal(shape),
+                    "verbose":-9,
+                    "verb_log":0,
+                    "signals_filename":"",
+                },
+            )
+            print(
+                f"CMA-ES retraction {iteration+1}: {dimension} variables, "
+                f"population={es.popsize}, baseline cost={base_cost}, "
+                f"sampling={self._SamplingDiagnostics(base_sample_poses)}",flush=True,
+            )
+            local_stop_message = "Generation budget reached"
+            for generation in range(cfg.cma_max_generations):
+                termination = es.stop()
+                if termination:
+                    local_stop_message = f"CMA-ES stopped: {termination}"
+                    break
+                solutions = es.ask()
+                costs = []
+                generation_best_cost = best_cost
+                generation_best_ctrl_poses = None
+                for solution in solutions:
+                    delta = np.asarray(solution,dtype=np.float64)*scales
+                    ctrl_poses = self.UpdateCtrlPoses(
+                        delta.reshape(-1,6),update_original=False
+                    )
+                    cost = Evaluate(ctrl_poses)
+                    costs.append(cost)
+                    if cost<generation_best_cost:
+                        generation_best_cost = cost
+                        generation_best_ctrl_poses = ctrl_poses
+                total_generations += 1
+                if not np.isfinite(costs).any():
+                    local_stop_message = "All population costs were non-finite"
+                    print(f"  {local_stop_message}",flush=True)
+                    break
+                es.tell(solutions,costs)
+                validation = None
+                if generation_best_ctrl_poses is not None:
+                    best_cost = generation_best_cost
+                    best_ctrl_poses = generation_best_ctrl_poses
+                    valid,validation = self._ValidateTrajectory(best_ctrl_poses,sample_grid)
+                    if valid:
+                        valid_snapshots.append(best_ctrl_poses.copy())
+                print(
+                    f"  generation {generation+1}: evaluations={total_evaluations}, "
+                    f"best cost={best_cost}, validation={validation}",flush=True,
+                )
+
+            # 采样期间self中的基准保持不变；仅在本轮结束后执行retraction。
+            self.se3_ctrl_poses = best_ctrl_poses
+            self.se3_opt_poses = [
+                best_ctrl_poses[index] for index in self.opt_poses_index
+            ]
+            if np.isfinite(base_cost) and np.isfinite(best_cost):
+                threshold = max(
+                    cfg.cost_abs_change_tol,
+                    cfg.cost_rel_change_tol*max(abs(base_cost),abs(best_cost)),
+                )
+                significant_improvement = base_cost-best_cost>threshold
+            else:
+                significant_improvement = np.isfinite(best_cost)
+            stagnation_count = 0 if significant_improvement else stagnation_count+1
+            print(
+                f"CMA-ES retraction {iteration+1}: cost={best_cost}, "
+                f"stagnation={stagnation_count}, stop={local_stop_message}",flush=True,
+            )
+            if stagnation_count>=cfg.cma_retraction_patience:
+                stop_message = "Retraction improvement tolerance reached"
+                break
+
+        final_grid,final_diagnostics,rolled_back = self._SelectFinalTrajectory(
+            initial_ctrl_poses,valid_snapshots,"CMA-ES"
+        )
+
+        # 回滚和候选点更新后重新评估，返回值与实际导出的轨迹一致。
+        _,final_sample_poses = self._SampleTrajectory(
+            self.se3_ctrl_poses,final_grid
+        )
+        final_indices = [
+            self.hex_state.GetRobotFeasiCostPoints(pose) for pose in final_sample_poses
+        ]
+        final_cost,feasibility_cost,acceleration_cost = TrajectoryCost(
+            self.se3_ctrl_poses,final_indices,final_grid
+        )
+        total_evaluations += 1
+        if not np.isfinite(final_cost):
+            self.se3_ctrl_poses = initial_ctrl_poses
+            self.se3_opt_poses = [
+                initial_ctrl_poses[index] for index in self.opt_poses_index
+            ]
+            raise RuntimeError("Final CMA-ES cost is non-finite; restored the initial controls")
+        cumulative_delta = np.concatenate([
+            np.asarray(trlog(
+                (initial_ctrl_poses[index].inv()*self.se3_ctrl_poses[index]).A,
+                twist=True,check=False,
+            ),dtype=np.float64)
+            for index in self.opt_poses_index
+        ])
+        message = f"{stop_message}; {local_stop_message}"
+        if rolled_back:
+            message += "; rolled back to the last hard-feasible controls"
+        out_dir = Path(LEGGED_GYM_ROOT_DIR)/"legged_gym/expert_complex_utils/SE3_path"
+        json_file = out_dir/f"optimized_cma_es_path_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
+        output_path = self.WriteJson(str(json_file),sample_grid=final_grid)
+        print(f"CMA-ES finished: cost={final_cost}, validation={final_diagnostics}",flush=True)
+        return OptimizeResult(
+            x=cumulative_delta,fun=float(final_cost),success=True,
+            status=0 if stagnation_count>=cfg.cma_retraction_patience else 1,
+            message=message,nit=total_generations,nfev=total_evaluations,
+            retraction_iterations=iteration+1,rolled_back=rolled_back,
+            validation=final_diagnostics,feasibility_cost=float(feasibility_cost),
+            acceleration_cost=float(acceleration_cost),output_path=output_path,
+        )
+
     def Geodesic(self,T1:SE3,T2:SE3,u:float)->SE3:
         """
         SE3的螺旋测底线差值 u=[0,1]从0到1变化时 从T1变化到T2
@@ -574,16 +893,14 @@ class PostProcess:
         T123=self.Geodesic(T12,T23,u)
         return self.Geodesic(T012,T123,u)
 
-    def WriteJson(self,json_file:str,dense_sample_dt:float=0.5)->Path:
+    def WriteJson(self,json_file:str,sample_grid:TrajectorySampleGrid|None=None)->Path:
         """
         将优化后的分段三次 SE(3) Bezier 路径写入可视化 JSON 格式。
 
         输出格式与 ``SE3_path/example_se3_path.json`` 一致，包含路标点、
-        按全局真实时间均匀采样的稠密轨迹，以及每段的控制点和持续时间。
+        按距离重采样并保存真实时间戳的稠密轨迹，以及每段的控制点和持续时间。
         所有位姿均使用 ``t``（平移）、``ang``（轴角角度）和 ``vec``（单位轴）保存。
         """
-        if not np.isfinite(dense_sample_dt) or dense_sample_dt<=0.0:
-            raise ValueError("dense_sample_dt must be finite and positive")
         if self.se3_segment_nums<=0 or len(self.se3_ctrl_poses)!=4*self.se3_segment_nums:
             raise RuntimeError("No valid Bezier control poses are available to write")
         if len(self.se3_segment_times)!=self.se3_segment_nums:
@@ -616,29 +933,7 @@ class PostProcess:
         segment_times = np.asarray(self.se3_segment_times,dtype=np.float64)
         if not np.isfinite(segment_times).all() or np.any(segment_times<=0.0):
             raise ValueError("Bezier segment times must be finite and positive")
-        segment_end_times = np.cumsum(segment_times)
-        total_time = float(segment_end_times[-1])
-
-        # 除最终不足一个间隔的尾段外，稠密轨迹的时间点严格等间隔，并总会包含终点。
-        dense_times = np.arange(0.0,total_time,dense_sample_dt,dtype=np.float64)
-        if len(dense_times)==0 or dense_times[0]!=0.0:
-            dense_times = np.insert(dense_times,0,0.0)
-        if total_time-dense_times[-1]>1e-12:
-            dense_times = np.append(dense_times,total_time)
-        else:
-            dense_times[-1] = total_time
-        dense_poses = []
-        for sample_time in dense_times:
-            segment_index = min(
-                int(np.searchsorted(segment_end_times,sample_time,side="right")),
-                self.se3_segment_nums-1,
-            )
-            segment_start_time = 0.0 if segment_index==0 else segment_end_times[segment_index-1]
-            u = (sample_time-segment_start_time)/segment_times[segment_index]
-            dense_poses.append(self.Bezier(
-                self.se3_ctrl_poses[4*segment_index:4*segment_index+4],
-                float(np.clip(u,0.0,1.0)),
-            ))
+        dense_times,dense_poses = self._SampleTrajectory(self.se3_ctrl_poses,sample_grid)
 
         waypoints = [self.se3_ctrl_poses[0]]
         waypoints.extend(
@@ -687,6 +982,7 @@ if __name__ == "__main__":
     
     post.ShortCutPath()
     post.Optimize()
+    # post.Optimize_CMA_ES()
 
     # post.se3_path_short.clear()
     # for se3 in post.se3_path:
@@ -696,7 +992,7 @@ if __name__ == "__main__":
     # json_file = os.path.join(out_dir,
     #                              f"initial_se3_path_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
         
-    # post.WriteJson(json_file,dense_sample_dt=0.02)
+    # post.WriteJson(json_file)
     # axises= np.random.random((2,3))
     # axises = axises/np.linalg.norm(axises,axis=1,keepdims=True)
     # T1 = SE3.AngleAxis(1.3,axises[0])*SE3(np.random.random((3,)))

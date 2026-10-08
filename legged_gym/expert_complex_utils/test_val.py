@@ -2,8 +2,11 @@ from legged_gym.expert_complex_utils import RoboVoxels,Kinematic,HexState
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-ro = RoboVoxels(Kinematic())
-ro.PlotRobotVoxels()
+# ro = RoboVoxels(Kinematic())
+# ro.PlotRobotVoxels()
+
+hex = HexState(Kinematic())
+
 
 # flat_index = ro.body_voxels.Pos2FlatIndex(np.array(
 #     [[0.4,0.0,-0.0],
