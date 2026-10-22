@@ -1,5 +1,5 @@
 # 定义表面点地图：读取 SLAM 点云或 STL mesh 表面，得到点/法向/平面质量，
-# 筛选吸盘可落脚点，再把可落脚区域按 voxel 降采样成在线查询地图。
+# 筛选吸盘可落脚点，再把可落脚和非落脚表面分别降采样成在线查询地图。
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -14,13 +14,10 @@ from legged_gym import LEGGED_GYM_ROOT_DIR
 
 @dataclass
 class LandingQuality:
-    """每个原始点作为吸盘中心时的局部几何质量。"""
+    """原始表面点的平面误差和几何可落脚分类。"""
 
-    coverage_ratio: np.ndarray
     plane_error: np.ndarray
-    normal_variance: np.ndarray
     blocked_mask: np.ndarray
-    score: np.ndarray
     valid_mask: np.ndarray
 
 
@@ -28,10 +25,9 @@ class PointMap:
     """从 SLAM 点云或 STL mesh 构建可落脚点地图。 输入cloud_file类型为.npz会直接加载计算结果，如果是STL或者ply会进行处理
 
     设计原则：
-    1. 原始表面点用于估计/读取法向、平面误差、边界/吸盘覆盖率。
-    2. voxel 降采样只用于减少在线候选点数量。
-    3. 每个 voxel 的代表点选原始点云中的高分点，而不是 voxel 中心或均值，
-       避免代表点脱离真实表面。
+    1. 同一半径邻域的协方差同时决定原始点的法向和平面误差。
+    2. 可落脚点与其余表面点分别降采样，后者仍参与碰撞地图构建。
+    3. 每个 voxel 保留最靠近体素中心的原始点及其法向。
 
     坐标约定：
     - self._raw_points / self.points 均为 (N, 3)，与 PLY 文件坐标一致。
@@ -39,23 +35,22 @@ class PointMap:
 
     注：
     点云处理降采样后为 self.points。
-    self.points[:self.landing_count] 是可落脚点，后续点是 blocked 点。
+    self.points[:self.landing_count] 是可落脚点，后续点是非落脚表面点。
     self.landing_points 是可落脚点沿法向量向外偏移后的查询点。
     """
 
     def __init__(
         self,
         target_file: str,
-        voxel_size: float = 0.04, #降采样后的点的平均间隔
+        voxel_size: float = 0.02, #降采样后的点的平均间隔
         suction_diameter: float = 0.04, #吸盘直径
-        normal_radius: float = 0.08, #
-        coverage_threshold: float = 0.85,
-        plane_error_threshold: float = 0.01,
+        normal_radius: float = 0.04, #
+        plane_error_threshold: float = 0.03,
         edge_buffer_distance: Optional[float] = None,
         edge_normal_angle_threshold: float = np.deg2rad(35.0),
         boundary_angle_gap_threshold: float = np.deg2rad(120.0),
         source_scale: Optional[float] = None,
-        surface_sample_spacing: float = 0.015, #对STL文件表面的采样间距，建议取比voxel_size更细一些
+        surface_sample_spacing: float = 0.01, #对STL文件表面的采样间距，建议取比voxel_size更细一些
         sensor_pose_file: Optional[str] = None,
         # suction_to_foot_offset:float = 0.0385, #吸盘末端到足端的距离，用于偏移landing_point 适用于hex_v4
         suction_to_foot_offset:float = 0.03, #吸盘末端到足端的距离，用于偏移landing_point 适用于hex_magnetic
@@ -68,7 +63,6 @@ class PointMap:
         self.voxel_size = float(voxel_size)
         self.suction_radius = float(suction_diameter) * 0.5
         self.normal_radius = float(normal_radius)
-        self.coverage_threshold = float(coverage_threshold)
         self.plane_error_threshold = float(plane_error_threshold)
         self.edge_buffer_distance = (
             self.suction_radius if edge_buffer_distance is None else float(edge_buffer_distance)
@@ -91,17 +85,17 @@ class PointMap:
         self._raw_points: Optional[np.ndarray] = None
         self._raw_tree: Optional[cKDTree] = None
         self._raw_normals: Optional[np.ndarray] = None
+        self._mesh_sample_normals: Optional[np.ndarray] = None
         self._raw_plane_error: Optional[np.ndarray] = None
         self._raw_blocked_mask: Optional[np.ndarray] = None
         self._quality: Optional[LandingQuality] = None
         self._raw_edge_index:Optional[np.ndarray] = None
 
-        # 在线查询使用的降采样后表面点，包含可落脚点和 blocked 点。
-        # points[:landing_count] 是可落脚点，后续点是 blocked 点。
+        # 在线查询使用的降采样后表面点，包含可落脚点和其余表面点。
+        # points[:landing_count] 是可落脚点，后续点是非落脚表面点。
         self.points = np.zeros((0, 3), dtype=np.float32)
         self.normals = np.zeros((0, 3), dtype=np.float32)
         self.landing_count = 0
-        self._landing_score = np.zeros(0, dtype=np.float32)
         self._tree: Optional[cKDTree] = None
         # 维护一个属性，保存楞边
         self.edge_points = np.zeros((0,3),dtype=np.float32)
@@ -192,9 +186,15 @@ class PointMap:
         finite_mask = np.isfinite(self._raw_points).all(axis=1)
         if self._raw_normals is not None:
             finite_mask &= np.isfinite(self._raw_normals).all(axis=1)
+        if self._mesh_sample_normals is not None:
+            finite_mask &= np.isfinite(self._mesh_sample_normals).all(axis=1)
         self._raw_points = self._raw_points[finite_mask].astype(np.float32)
         if self._raw_normals is not None:
             self._raw_normals = self._NormalizeRows(self._raw_normals[finite_mask].astype(np.float32))
+        if self._mesh_sample_normals is not None:
+            self._mesh_sample_normals = self._NormalizeRows(
+                self._mesh_sample_normals[finite_mask].astype(np.float32)
+            )
         if self._raw_plane_error is not None:
             self._raw_plane_error = self._raw_plane_error[finite_mask].astype(np.float32)
         if self._raw_points.shape[0] == 0:
@@ -205,7 +205,6 @@ class PointMap:
         if self._raw_normals is None:
             self.normals[:, 2] = 1.0
         self.landing_count = self.points.shape[0]
-        self._landing_score = np.ones(self.points.shape[0], dtype=np.float32)
         #self._RebuildQueryTrees()
         self._UpdateBounds()
 
@@ -264,8 +263,8 @@ class PointMap:
         points, normals = self._SampleMeshSurface(mesh, self.surface_sample_spacing)
         normals = self._OrientMeshNormalsOutward(mesh, points, normals)
         self._raw_points = points.astype(np.float32)
-        self._raw_normals = normals.astype(np.float32)
-        self._raw_plane_error = np.zeros(self._raw_points.shape[0], dtype=np.float32)
+        # 网格法向只用来确定 PCA 法向的正负，平面误差由采样邻域计算。
+        self._mesh_sample_normals = normals.astype(np.float32)
 
     def _RepairMeshForSampling(self, mesh):
         try:
@@ -396,9 +395,9 @@ class PointMap:
         """构建完整在线地图：法向/平面误差 -> 吸盘落脚质量 -> voxel 代表点。"""
         if self._raw_points is None or self._raw_tree is None:
             raise RuntimeError("raw source has not been loaded; use _BuildFromRawFile first")
-        if self._raw_normals is None:
+        if self._raw_normals is None or self._raw_plane_error is None:
             if self.verbose:
-                print("cal norm")
+                print("cal norm and plane error")
             self.NormCal()
         if self.verbose:
             print("detect edge")
@@ -412,6 +411,8 @@ class PointMap:
 
     def _WriteSavedFile(self, saved_file: Optional[str] = None):
         """把处理后的点云地图保存为 npz 文件。"""
+        if self._raw_points is None:
+            raise RuntimeError("raw surface points are unavailable; rebuild the map from its source file")
         saved_file = self.saved_file if saved_file is None else saved_file
         saved_dir = os.path.dirname(saved_file)
         os.makedirs(saved_dir or ".", exist_ok=True)
@@ -421,6 +422,7 @@ class PointMap:
             self.DownSample()
         np.savez_compressed(
             saved_file,
+            map_version=np.array([3], dtype=np.int32),
             # file_type=np.array([self.file_type]),
             original_file=np.array(["" if self.original_file is None else self.original_file]),
             source_scale=np.array([np.nan if self.source_scale is None else float(self.source_scale)], dtype=np.float32),
@@ -430,13 +432,13 @@ class PointMap:
             # mesh_normal_check_offset=np.array([np.nan if self.mesh_normal_check_offset is None else float(self.mesh_normal_check_offset)], dtype=np.float32),
             # mesh_area=np.array([np.nan if self.mesh_area is None else float(self.mesh_area)], dtype=np.float32),
             bounds=self._bounds,
+            raw_points=self._raw_points,
             # voxel_size=np.array([self.voxel_size], dtype=np.float32),
             # suction_radius=np.array([self.suction_radius], dtype=np.float32),
             # normal_radius=np.array([self.normal_radius], dtype=np.float32),
             points=self.points,
             normals=self.normals,
             landing_count=np.array([self.landing_count], dtype=np.int64),
-            landing_score=self._landing_score,
             edge_points = self.edge_points
         )
         self.saved_file = saved_file
@@ -449,6 +451,13 @@ class PointMap:
             raise FileNotFoundError(saved_file)
         has_bounds = False
         with np.load(saved_file) as data:
+            version = int(data["map_version"][0]) if "map_version" in data else 0
+            if version < 2:
+                warnings.warn("point map uses the old filtering rules; rebuild it from the raw source")
+            if "raw_points" in data:
+                self._raw_points = data["raw_points"].astype(np.float32)
+            else:
+                warnings.warn("point map has no raw_points; rebuild it from the raw source to display original samples")
             # if "file_type" in data:
             #     self.file_type = str(data["file_type"][0])
             if "original_file" in data:
@@ -471,11 +480,10 @@ class PointMap:
                 has_bounds = True
             self.points = data["points"].astype(np.float32)
             self.normals = data["normals"].astype(np.float32)
-            self._landing_score = data["landing_score"].astype(np.float32)
             self.landing_count = int(data["landing_count"][0])
             self.edge_points = data["edge_points"].astype(np.float32)
-        self._raw_points = None
         self._raw_normals = None
+        self._mesh_sample_normals = None
         self._raw_plane_error = None
         self._raw_blocked_mask = None
         self._quality = None
@@ -548,42 +556,42 @@ class PointMap:
         return bool(out[0]) if is_single else out
 
     def NormCal(self, radius: Optional[float] = None, min_neighbors: int = 12):
-        """在原始点云上用 PCA 估计法向和平面误差。"""
+        """每点查询一次半径邻域，用其协方差同时求 PCA 法向和平面误差。"""
         radius = self.normal_radius if radius is None else float(radius)
+        if radius <= 0.0:
+            raise ValueError("normal radius must be positive")
         points = self._raw_points
-        max_nn = min(max(int(min_neighbors), 30), points.shape[0])
-        cloud = o3d.geometry.PointCloud()
-        cloud.points = o3d.utility.Vector3dVector(points.astype(np.float64))
-        cloud.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(
-                radius=radius,
-                max_nn=max_nn,
-            )
-        )
-        cloud.normalize_normals()
-        normals = np.asarray(cloud.normals, dtype=np.float32)
-        if normals.shape != points.shape:
-            raise RuntimeError("open3d failed to estimate normals for the raw point cloud")
+        normals = np.zeros_like(points)
         plane_error = np.full(points.shape[0], np.inf, dtype=np.float32)
 
-        for i, p in enumerate(points):
-            idx = self._raw_tree.query_ball_point(p, r=radius)
-            if len(idx) < min_neighbors:
-                k = max_nn
-                _, idx = self._raw_tree.query(p, k=k)
-                idx = np.atleast_1d(idx).tolist()
-            if len(idx) < 3:
-                plane_error[i] = 0.0
-                continue
+        for start in range(0, len(points), 2048):
+            neighborhoods = self._raw_tree.query_ball_point(points[start:start + 2048], r=radius)
+            for i, idx in enumerate(neighborhoods, start):
+                if len(idx) < max(3, int(min_neighbors)):
+                    continue
+                neigh = points[idx].astype(np.float64)
+                centered = neigh - neigh.mean(axis=0)
+                covariance = centered.T @ centered / len(idx)
+                eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+                normals[i] = eigenvectors[:, 0]
+                plane_error[i] = np.sqrt(max(float(eigenvalues[0]), 0.0))
 
-            neigh = points[idx]
-            center = neigh.mean(axis=0)
-            centered = neigh - center
-            n = normals[i]
-            dist_to_plane = centered @ n
-            plane_error[i] = float(np.sqrt(np.mean(dist_to_plane * dist_to_plane)))
+        invalid = ~np.isfinite(plane_error)
+        if np.any(invalid):
+            if self._mesh_sample_normals is not None:
+                normals[invalid] = self._mesh_sample_normals[invalid]
+            elif np.any(~invalid):
+                valid_tree = cKDTree(points[~invalid])
+                _, nearest = valid_tree.query(points[invalid])
+                normals[invalid] = normals[~invalid][nearest]
+            else:
+                normals[invalid, 2] = 1.0
 
-        normals = self._OrientRawCloudNormals(points, normals)
+        if self._mesh_sample_normals is not None:
+            flip = np.einsum("ij,ij->i", normals, self._mesh_sample_normals) < 0.0
+            normals[flip] *= -1.0
+        else:
+            normals = self._OrientRawCloudNormals(points, normals)
         self._raw_normals = normals
         self._raw_plane_error = plane_error
 
@@ -646,136 +654,71 @@ class PointMap:
         out[flip] *= -1.0
         return out
 
-    def DetectRawBlockedArea(
-        self,
-        k_neighbors: int = 32,
-        min_radius_neighbors: int = 8,
-    ) -> np.ndarray:
-        """在原始点云上标记不能落脚的区域。
-
-        blocked 区域包含法向突变、邻域稀疏、切平面角度覆盖有大缺口，
-        以及这些区域按 edge_buffer_distance 膨胀后的缓冲区。
-        """
+    def DetectRawBlockedArea(self) -> np.ndarray:
+        """检测尖锐边和开放边界，并排除其吸附半径范围内的表面点。"""
         if self._raw_normals is None:
             self.NormCal()
 
         points = self._raw_points
         normals = self._raw_normals
-
-        k = min(max(3, int(k_neighbors)), points.shape[0])
-        _, idx = self._raw_tree.query(points, k=k)
-        idx = np.asarray(idx)
-        neigh_normals = normals[idx]
-        # 法向正负可能未全局一致；blocked 检测只关心法向轴的夹角。
-        cos_angle = np.abs(np.clip(np.einsum("ij,ikj->ik", normals, neigh_normals), -1.0, 1.0))
-        normal_edge = np.min(cos_angle, axis=1) < np.cos(self.edge_normal_angle_threshold)
-        self._raw_edge_index = np.where(normal_edge)[0]
-        self.edge_points = self._raw_points[self._raw_edge_index]
-        self._edge_tree = cKDTree(self._raw_points[self._raw_edge_index])
-
-        # radius_counts = np.array(
-        #     [len(v) for v in self._raw_tree.query_ball_point(points, r=self.normal_radius)],
-        #     dtype=np.int32,
-        # )
-        # sparse_boundary = radius_counts < int(min_radius_neighbors)
-
+        normal_edge = np.zeros(points.shape[0], dtype=np.bool_)
         boundary_gap = np.zeros(points.shape[0], dtype=np.bool_)
-        for i in range(points.shape[0]):
-            neigh_idx = idx[i, 1:]
-            vec = points[neigh_idx] - points[i]
-            tangent0 = self._AnyTangent(normals[i])
-            tangent1 = np.cross(normals[i], tangent0)
-            tangent1 /= max(np.linalg.norm(tangent1), 1e-12)
-            x = vec @ tangent0
-            y = vec @ tangent1
-            valid = (x * x + y * y) > 1e-12
-            if np.count_nonzero(valid) < 3:
-                boundary_gap[i] = True
-                continue
-            angle = np.sort(np.arctan2(y[valid], x[valid]))
-            gaps = np.diff(np.r_[angle, angle[0] + 2.0 * np.pi])
-            boundary_gap[i] = np.max(gaps) > self.boundary_angle_gap_threshold
-
-        # blocked_mask = sparse_boundary | boundary_gap | normal_edge
-        blocked_mask = boundary_gap | normal_edge
-
-        unsafe_idx = np.where(blocked_mask)[0]
-        if unsafe_idx.size > 0 and self.edge_buffer_distance > 0.0:
-            buffer_hits = self._raw_tree.query_ball_point(
-                points[unsafe_idx],
-                r=self.edge_buffer_distance,
+        valid_normal = np.isfinite(self._raw_plane_error)
+        angle_limit = np.cos(self.edge_normal_angle_threshold)
+        for start in range(0, len(points), 2048):
+            neighborhoods = self._raw_tree.query_ball_point(
+                points[start:start + 2048], r=self.normal_radius
             )
-            if len(buffer_hits) > 0:
-                non_empty = [np.asarray(v, dtype=np.int64) for v in buffer_hits if len(v) > 0]
-                if len(non_empty) > 0:
-                    near_idx = np.unique(np.concatenate(non_empty))
-                    blocked_mask[near_idx] = True
+            for i, neighbors in enumerate(neighborhoods, start):
+                if not valid_normal[i]:
+                    boundary_gap[i] = True
+                    continue
+                neigh_idx = np.asarray(neighbors, dtype=np.int64)
+                neigh_idx = neigh_idx[neigh_idx != i]
+                comparison_idx = neigh_idx[valid_normal[neigh_idx]]
+                if comparison_idx.size:
+                    cos_angle = np.abs(np.clip(normals[comparison_idx] @ normals[i], -1.0, 1.0))
+                    normal_edge[i] = np.min(cos_angle) < angle_limit
+                vec = points[neigh_idx] - points[i]
+                tangent0 = self._AnyTangent(normals[i])
+                tangent1 = np.cross(normals[i], tangent0)
+                tangent1 /= max(np.linalg.norm(tangent1), 1e-12)
+                x = vec @ tangent0
+                y = vec @ tangent1
+                valid = (x * x + y * y) > 1e-12
+                if np.count_nonzero(valid) < 3:
+                    boundary_gap[i] = True
+                    continue
+                angle = np.sort(np.arctan2(y[valid], x[valid]))
+                gaps = np.diff(np.r_[angle, angle[0] + 2.0 * np.pi])
+                boundary_gap[i] = np.max(gaps) > self.boundary_angle_gap_threshold
+
+        feature_mask = boundary_gap | normal_edge
+        self._raw_edge_index = np.flatnonzero(feature_mask)
+        self.edge_points = points[self._raw_edge_index]
+        self._edge_tree = cKDTree(self.edge_points) if self.edge_points.size else None
+        blocked_mask = feature_mask.copy()
+        if self._edge_tree is not None and self.edge_buffer_distance > 0.0:
+            distance, _ = self._edge_tree.query(points)
+            blocked_mask |= distance < self.edge_buffer_distance
 
         self._raw_blocked_mask = blocked_mask
         return blocked_mask
 
-    def FilterLandingCandidates(
-        self,
-        disk_sample_num: int = 16,
-        coverage_search_radius: float = 0.015,
-    ) -> LandingQuality:
-        """判断原始点是否能容纳一个吸盘圆盘。
-        先删除 blocked 区域，再用吸盘圆盘覆盖率和平面误差做硬筛。
-        normal_variance 只作为评分和调试量，不再作为硬筛条件。
-        """
+    def FilterLandingCandidates(self) -> LandingQuality:
+        """按照边界距离和平面误差筛选几何可落脚点。"""
         if self._raw_normals is None:
             self.NormCal()
         if self._raw_blocked_mask is None:
             self.DetectRawBlockedArea()
 
-        points = self._raw_points
-        normals = self._raw_normals
         plane_error = self._raw_plane_error
         blocked_mask = self._raw_blocked_mask
-
-        angles = np.linspace(0.0, 2.0 * np.pi, disk_sample_num, endpoint=False)
-        unit_circle = np.stack([np.cos(angles), np.sin(angles)], axis=1).astype(np.float32)
-
-        coverage_ratio = np.zeros(points.shape[0], dtype=np.float32)
-        normal_variance = np.ones(points.shape[0], dtype=np.float32)
-
-        for i, (p, n) in enumerate(zip(points, normals)):
-            tangent0 = self._AnyTangent(n)
-            tangent1 = np.cross(n, tangent0)
-            tangent1 /= max(np.linalg.norm(tangent1), 1e-12)
-            disk_points = (
-                p[None, :]
-                + self.suction_radius * unit_circle[:, 0:1] * tangent0[None, :]
-                + self.suction_radius * unit_circle[:, 1:2] * tangent1[None, :]
-            )
-
-            dist, idx = self._raw_tree.query(disk_points, k=1)
-            covered = dist <= coverage_search_radius
-            coverage_ratio[i] = float(np.mean(covered))
-            if covered.any():
-                neigh_normals = normals[np.asarray(idx)[covered]]
-                cos_angle = np.abs(np.clip(neigh_normals @ n, -1.0, 1.0))
-                normal_variance[i] = float(np.mean(1.0 - cos_angle))
-
-        valid_mask = (
-            (~blocked_mask)
-            & (coverage_ratio >= self.coverage_threshold)
-            & (plane_error <= self.plane_error_threshold)
-        )
-
-        score = (
-            coverage_ratio
-            - 5.0 * plane_error
-            - 0.5 * normal_variance
-        ).astype(np.float32)
-        score[~valid_mask] = -np.inf #对于无效的落脚点，分数一律为-inf
+        valid_mask = (~blocked_mask) & (plane_error <= self.plane_error_threshold)
 
         self._quality = LandingQuality(
-            coverage_ratio=coverage_ratio,
             plane_error=plane_error,
-            normal_variance=normal_variance,
             blocked_mask=blocked_mask,
-            score=score,
             valid_mask=valid_mask,
         )
         return self._quality
@@ -789,69 +732,37 @@ class PointMap:
         return tangent.astype(np.float32)
 
     def DownSample(self):
-        """对可落脚点和 blocked 点分别做 voxel 下采样。
-
-        可落脚点每格保留 score 最高的原始点；blocked 点每格保留一个原始点，
-        供后续避障查询使用，避免保存和读取完整原始点云。
-        """
+        """对可落脚点和其余表面点分别采样，保留各格最靠近中心的原始点。"""
         if self._quality is None:
             self.FilterLandingCandidates()
 
         valid_idx = np.where(self._quality.valid_mask)[0]
         if valid_idx.size == 0:
-            warnings.warn("no valid landing point after filtering; keep raw cloud as fallback")
-            # valid_idx = np.arange(self._raw_points.shape[0])
-            score = np.zeros(valid_idx.shape[0], dtype=np.float32)
-        else:
-            score = self._quality.score[valid_idx]
+            warnings.warn("no valid landing point after filtering; all surface points remain in the collision map")
 
-        picked_idx = self._VoxelPickRawIndices(valid_idx, score)
-        blocked_idx = np.where(self._quality.blocked_mask)[0]
-        if blocked_idx.size > 0:
-            blocked_score = np.zeros(blocked_idx.shape[0], dtype=np.float32)
-            picked_blocked_idx = self._VoxelPickRawIndices(blocked_idx, blocked_score)
-        else:
-            picked_blocked_idx = np.zeros(0, dtype=np.int64)
+        picked_idx = self._VoxelPickRawIndices(valid_idx)
+        nonlanding_idx = np.where(~self._quality.valid_mask)[0]
+        picked_nonlanding_idx = self._VoxelPickRawIndices(nonlanding_idx)
 
-        combined_idx = np.concatenate([picked_idx, picked_blocked_idx]).astype(np.int64)
+        combined_idx = np.concatenate([picked_idx, picked_nonlanding_idx]).astype(np.int64)
         self.points = self._raw_points[combined_idx]
         self.normals = self._raw_normals[combined_idx]
         self.landing_count = picked_idx.shape[0]
-        self._landing_score = np.full(combined_idx.shape[0], -np.inf, dtype=np.float32)
-        if self._quality is not None and np.isfinite(self._quality.score[picked_idx]).any():
-            self._landing_score[:picked_idx.shape[0]] = self._quality.score[picked_idx]
-        else:
-            self._landing_score[:picked_idx.shape[0]] = 0.0
         self._RebuildQueryTrees()
 
-    def _VoxelPickRawIndices(self, raw_idx: np.ndarray, score: np.ndarray) -> np.ndarray:
+    def _VoxelPickRawIndices(self, raw_idx: np.ndarray) -> np.ndarray:
         if raw_idx.size == 0:
             return np.zeros(0, dtype=np.int64)
 
-        valid_points = self._raw_points[raw_idx]
-        cloud = o3d.geometry.PointCloud()
-        cloud.points = o3d.utility.Vector3dVector(valid_points.astype(np.float64))
-        min_bound = valid_points.min(axis=0).astype(np.float64) - 1e-6
-        max_bound = valid_points.max(axis=0).astype(np.float64) + 1e-6
-        _, _, voxel_traces = cloud.voxel_down_sample_and_trace(
-            self.voxel_size,
-            min_bound,
-            max_bound,
-            approximate_class=False,
-        )
-
-        picked = []
-        for trace in voxel_traces:
-            local_idx = np.asarray(trace, dtype=np.int64)
-            if local_idx.size == 0:
-                continue
-            best_local = local_idx[int(np.argmax(score[local_idx]))]
-            picked.append(int(raw_idx[best_local]))
-
-        if len(picked) == 0:
-            warnings.warn("open3d voxel trace returned no groups; keep input raw points as fallback")
-            return raw_idx
-        return np.asarray(picked, dtype=np.int64)
+        points = self._raw_points[raw_idx].astype(np.float64)
+        origin = self._bounds[:, 0].astype(np.float64)
+        voxel_index = np.floor((points - origin) / self.voxel_size).astype(np.int64)
+        center = origin + (voxel_index + 0.5) * self.voxel_size
+        distance2 = np.sum((points - center) ** 2, axis=1)
+        _, group = np.unique(voxel_index, axis=0, return_inverse=True)
+        order = np.lexsort((raw_idx, distance2, group))
+        _, first = np.unique(group[order], return_index=True)
+        return raw_idx[order[first]]
 
     def GetNorm(
         self,
@@ -870,16 +781,6 @@ class PointMap:
             return self.normals[out[0]]
             # return int(out[0])
         return self.normals[out]
-
-    def GetLandingScore(self, points: np.ndarray) -> np.ndarray:
-        """查询点最近 landing 点，返回对应的 self.landing_points 索引。"""
-        query, is_single, _ = self._AsPointsNx3(points)
-        if self._landing_tree is None or self.landing_points.shape[0] == 0:
-            out = np.full(query.shape[0], -1, dtype=np.int64)
-        else:
-            _, landing_idx = self._landing_tree.query(query, k=1)
-            out = np.asarray(landing_idx, dtype=np.int64)
-        return int(out[0]) if is_single else out
 
     def _PlotSourceMesh(self, plotter, pv, opacity: float = 0.12):
         if self._InferFileType(self.original_file) == 'stl' or 'cloud':
@@ -944,8 +845,8 @@ class PointMap:
 
         布局为左侧三行、右侧一个大图：
         1. 原始点云
-        2. 剔除 edge/boundary 及其缓冲区后的原始点
-        3. 最终 voxel 下采样后的在线候选点
+        2. 降采样后的可落脚点
+        3. 降采样后的非落脚表面点及边界特征点
         4. 右侧叠加以上三部分；黑色箭头为 PCA 计算后的下采样点法向。
         """
         try:
@@ -959,24 +860,17 @@ class PointMap:
             except Exception:
                 pass
 
-        if self._raw_points is not None:
-            if self._raw_blocked_mask is None:
-                self.DetectRawBlockedArea()
-            if self._quality is None:
-                self.FilterLandingCandidates()
-            if self.points is None or self.points.shape[0] == 0:
-                self.DownSample()
-            raw_points = self._raw_points
-            landing_raw_points = self._raw_points[~self._raw_blocked_mask]
-        else:
-            raw_points = np.zeros((0, 3), dtype=np.float32)
-            landing_raw_points = self.points[:self.landing_count]
+        raw_points = (
+            self._raw_points
+            if self._raw_points is not None
+            else np.zeros((0, 3), dtype=np.float32)
+        )
         downsampled_points = self.points[:self.landing_count]
-        downsampled_blocked_points = self.points[self.landing_count:]
+        downsampled_nonlanding_points = self.points[self.landing_count:]
 
         if screenshot_path is not None:
             off_screen = True
-        plotter = pv.Plotter(shape="3|1", off_screen=off_screen, window_size=(1600, 1000))
+        plotter = pv.Plotter(shape="2|2", off_screen=off_screen, window_size=(1600, 1000))
         plotter.set_background("white")
 
         def add_cloud(points: np.ndarray, color: str, size: float, opacity: float = 1.0):
@@ -992,41 +886,39 @@ class PointMap:
 
         # 左侧三行：单独看每个阶段。
         plotter.subplot(0)
-        self._PlotSourceMesh(plotter, pv, opacity=0.08)
-        add_cloud(raw_points, "lightgray", point_size, 1.0)
-        plotter.add_text(f"Raw surface samples\nN={raw_points.shape[0]}\n{self._SourceInfoText()}", font_size=10, color="black")
+        # self._PlotSourceMesh(plotter, pv, opacity=0.08)
+        add_cloud(raw_points, "lightgray", point_size+2, 1.0)
+        # plotter.add_text(f"Raw surface samples\nN={raw_points.shape[0]}\n{self._SourceInfoText()}", font_size=10, color="black")
         plotter.show_axes()
 
         plotter.subplot(1)
         self._PlotSourceMesh(plotter, pv, opacity=0.06)
         add_cloud(downsampled_points, "royalblue", point_size, 1.0)
-        plotter.add_text(
-            f"Voxel downsample landing points \nlanding={downsampled_points.shape[0]}",
-            font_size=10,
-            color="black",
-        )
+        # plotter.add_text(
+        #     f"Voxel downsample landing points \nlanding={downsampled_points.shape[0]}",
+        #     font_size=10,
+        #     color="black",
+        # )
         plotter.show_axes()
 
         plotter.subplot(2)
         self._PlotSourceMesh(plotter, pv, opacity=0.06)
-        # add_cloud(downsampled_points, "tomato", point_size + 1.0, 1.0)
-        # add_cloud(downsampled_blocked_points, "black", point_size + 1.0, 0.75)
-        add_cloud(self.edge_points,"black",point_size+1.0,0.8)
-        plotter.add_text(
-            # f"Voxel downsampled blocked points\nblocked={downsampled_blocked_points.shape[0]}",
-            f"Voxel edge_points points\nblocked={self.edge_points.shape[0]}",
-            font_size=10,
-            color="black",
-        )
+        add_cloud(downsampled_nonlanding_points, "black", point_size + 1.0, 0.75)
+        add_cloud(self.edge_points, "orange", point_size + 1.0, 0.8)
+        # plotter.add_text(
+        #     f"Voxel nonlanding points\nN={downsampled_nonlanding_points.shape[0]}"
+        #     f"\nedge/boundary={self.edge_points.shape[0]}",
+        #     font_size=10,
+        #     color="black",
+        # )
         plotter.show_axes()
 
         # 右侧大图：三类点叠加。
         plotter.subplot(3)
         self._PlotSourceMesh(plotter, pv, opacity=0.08)
         add_cloud(raw_points, "lightgray", max(point_size +2.5, 1.0), 0.18)
-        # add_cloud(landing_raw_points, "royalblue", point_size, 0.45)
         add_cloud(self.landing_points, "tomato", point_size + 3, 1.0)
-        add_cloud(downsampled_blocked_points, "black", point_size + 2, 0.75)
+        add_cloud(downsampled_nonlanding_points, "black", point_size + 2, 1.0)
         normal_text = ""
         if (
             show_normals
@@ -1042,15 +934,16 @@ class PointMap:
                 plotter.add_arrows(
                     arrow_points,
                     arrow_dirs,
-                    mag=float(normal_length),
+                    mag=float(normal_length)*2.0,
                     color="black",
                 )
                 normal_text = f"\ncomputed normals: black arrows ({arrow_count})"
-        plotter.add_text(
-            "Overlay\nraw: gray\nblocked-removed: blue\nlanding: red\nblocked: black" + normal_text + "\n" + self._SourceInfoText(),
-            font_size=10,
-            color="black",
-        )
+        # plotter.add_text(
+        #     "Overlay\nraw: gray\nlanding: red\nnonlanding: black"
+        #     + normal_text + "\n" + self._SourceInfoText(),
+        #     font_size=10,
+        #     color="black",
+        # )
         plotter.show_axes()
 
         plotter.link_views()
@@ -1066,7 +959,8 @@ if __name__=='__main__':
         # "/home/sharpa/valerian_ws/legged_gym/resources/environments/sutructure1/complex_surface.STL",
         # "/home/sharpa/valerian_ws/legged_gym/resources/environments/sutructure1/complex_surface_point_map.npz",
         # LEGGED_GYM_ROOT_DIR+"/resources/environments/sutructure1/complex_surface.STL",
-        LEGGED_GYM_ROOT_DIR+"/resources/environments/structure2/complex_surface3.STL",
+        # LEGGED_GYM_ROOT_DIR+"/resources/environments/structure2/complex_surface4.STL",
+        LEGGED_GYM_ROOT_DIR+"/resources/environments/structure2/complex_surface4_point_map.npz",
         # "/home/val/BIH_ws/legged_gym/resources/environments/sutructure1/complex_surface_point_map.npz",
         verbose=True,
     )
@@ -1076,5 +970,5 @@ if __name__=='__main__':
     # print(f"valid_raw={int(point_map._quality.valid_mask.sum())}")
     print(f"map_points={point_map.points.shape[0]}")
     print(f"landing_points={point_map.landing_count}")
-    print(f"blocked_points={point_map.points.shape[0] - point_map.landing_count}")
+    print(f"nonlanding_points={point_map.points.shape[0] - point_map.landing_count}")
     point_map.PlotProcessingStages()

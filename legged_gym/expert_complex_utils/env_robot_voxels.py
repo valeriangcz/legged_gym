@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Tuple,Union
 from math import degrees
 import numpy as np
-from scipy.ndimage import distance_transform_edt, map_coordinates
+from scipy.ndimage import distance_transform_edt, map_coordinates, label
 from .hex_utils import Kinematic
 from .point_map import PointMap
 from spatialmath import SE3
@@ -124,8 +124,6 @@ class Voxels:
         grid_index = np.clip(grid_index, 0, self.grid_shape[None, :] - 1)
         return self.GridIndex2FlatIndex(grid_index[0] if squeeze else grid_index)
     
-            
-
     def GridIndex2FlatIndex(self, grid_index: np.ndarray) -> int | np.ndarray:
         """把三维网格索引转换成一维索引。
 
@@ -274,13 +272,156 @@ class Voxels:
         )
         return float(sampled[0]) if squeeze else sampled
 
+class SphereVoxels:
+    """腿基坐标系中的方向栅格；alpha 为方位角，beta 为仰角，单位为弧度。
+
+    每个方向保存两个 IK 分支的径向前缀上界和区域编号。区域查询只使用
+    方向，不检查输入点的半径；落脚点自身的可行性由调用方负责。
+    """
+
+    def __init__(self, bounds: np.ndarray, scale: float):
+        """bounds 为 (2,2) 角度范围，scale 为角度步长，均使用弧度。"""
+        self.bounds = np.array(bounds, dtype=np.float64, copy=True)
+        self.scale = float(scale)
+        if (self.bounds.shape != (2, 2) or not np.isfinite(self.bounds).all()
+                or np.any(self.bounds[:, 1] <= self.bounds[:, 0])):
+            raise ValueError("bounds must be finite increasing ranges with shape (2,2)")
+        if not np.isfinite(self.scale) or self.scale <= 0:
+            raise ValueError("scale must be finite and positive")
+        if (self.bounds[0, 0] < -np.pi or self.bounds[0, 1] > np.pi
+                or self.bounds[1, 0] < -np.pi / 2 or self.bounds[1, 1] > np.pi / 2):
+            raise ValueError("alpha bounds must lie in [-pi,pi], beta in [-pi/2,pi/2] radians")
+
+        steps = (self.bounds[:, 1] - self.bounds[:, 0]) / self.scale
+        nearest = np.rint(steps)
+        # 可整除范围的弧度运算可能略超过整数，避免额外生成近零宽度格。
+        roundoff = 32 * np.finfo(np.float64).eps * np.maximum(1, np.abs(steps))
+        steps = np.where(np.abs(steps - nearest) <= roundoff, nearest, steps)
+        self.grid_shape = np.maximum(1, np.ceil(steps)).astype(np.int32)
+        self.grid_size = int(np.prod(self.grid_shape))
+        centers = []
+        for axis in range(2):
+            lower = self.bounds[axis, 0] + np.arange(self.grid_shape[axis]) * self.scale
+            upper = np.minimum(lower + self.scale, self.bounds[axis, 1])
+            centers.append((lower + upper) * 0.5)
+        self.alpha_values, self.beta_values = centers
+        alpha, beta = np.meshgrid(*centers, indexing="ij")
+        self.angle_centers = np.stack([alpha, beta], axis=-1)
+        sphere_points = np.column_stack([
+            self.angle_centers.reshape(-1, 2), np.ones(self.grid_size)
+        ])
+        self.directions = self.Sphere2Pos(sphere_points)
+        shape = (*self.grid_shape, 2)
+        self.radius_grid = np.full(shape, -np.inf, dtype=np.float64)
+        self.section_grid = np.full(shape, -1, dtype=np.int32)
+        self.section_count = np.zeros(2, dtype=np.int32)
+        self.safe_radius = None
+        self.required_radius = None
+
+    @staticmethod
+    def _AsPoints(points: np.ndarray) -> Tuple[np.ndarray, bool]:
+        points = np.asarray(points, dtype=np.float64)
+        single = points.shape == (3,)
+        if single:
+            points = points[None, :]
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError("points must have shape (3,) or (N,3)")
+        return points, single
+
+    def Pos2Sphere(self, pos: np.ndarray) -> np.ndarray:
+        """(x,y,z) -> (alpha,beta,r)，角度为弧度。零向量角度为 NaN。"""
+        points, single = self._AsPoints(pos)
+        horizontal = np.hypot(points[:, 0], points[:, 1])
+        radius = np.hypot(horizontal, points[:, 2])
+        result = np.column_stack([
+            np.arctan2(points[:, 1], points[:, 0]),
+            np.arctan2(points[:, 2], horizontal), radius,
+        ])
+        invalid = ~np.isfinite(points).all(axis=1) | (radius == 0)
+        result[invalid, :2] = np.nan
+        return result[0] if single else result
+
+    def Sphere2Pos(self, sphere_pos: np.ndarray) -> np.ndarray:
+        """(alpha,beta,r) -> (x,y,z)，角度输入为弧度，保留单点/批量形状。"""
+        points, single = self._AsPoints(sphere_pos)
+        alpha, beta = points[:, :2].T
+        radius = points[:, 2]
+        result = np.column_stack([
+            radius * np.cos(beta) * np.cos(alpha),
+            radius * np.cos(beta) * np.sin(alpha), radius * np.sin(beta),
+        ])
+        return result[0] if single else result
+
+    def Pos2GridIndex(self, pos: np.ndarray) -> np.ndarray:
+        """只按方向索引；无效点返回 (-1,-1)，上下边界均包含且不周期连接。"""
+        points, single = self._AsPoints(pos)
+        angles = self.Pos2Sphere(points)[:, :2]
+        tolerance = np.deg2rad(1e-10)  # 边界浮点容差，单位为弧度。
+        valid = (np.isfinite(angles).all(axis=1)
+                 & (angles >= self.bounds[:, 0] - tolerance).all(axis=1)
+                 & (angles <= self.bounds[:, 1] + tolerance).all(axis=1))
+        indices = np.full((len(points), 2), -1, dtype=np.int32)
+        clipped = np.clip(angles[valid], self.bounds[:, 0], self.bounds[:, 1])
+        grid_pos = (clipped - self.bounds[:, 0]) / self.scale
+        nearest = np.rint(grid_pos)
+        grid_pos = np.where(
+            np.abs((grid_pos - nearest) * self.scale) <= tolerance, nearest, grid_pos
+        )
+        indices[valid] = np.minimum(
+            np.floor(grid_pos).astype(np.int32), self.grid_shape - 1,
+        )
+        return indices[0] if single else indices
+
+    def LabelSections(self) -> None:
+        """只对通过整段要求厚度的方向作双分支四邻域分区。
+
+        未指定 required_radius 的手动表只按有限上界分区。
+        """
+        self.section_grid.fill(-1)
+        for branch in range(2):
+            valid = np.isfinite(self.radius_grid[..., branch])
+            if self.required_radius is not None:
+                valid &= self.radius_grid[..., branch] >= self.required_radius
+            labels, count = label(valid)
+            self.section_grid[..., branch] = labels - 1
+            self.section_count[branch] = count
+
+    def Pos2Section(self, B_points: np.ndarray) -> np.ndarray:
+        """按方向返回每点两个分支的标签；不比较半径。单点返回 (2,)。"""
+        points, single = self._AsPoints(B_points)
+        indices = self.Pos2GridIndex(points)
+        result = np.full((len(points), 2), -1, dtype=np.int32)
+        valid = (indices >= 0).all(axis=1)
+        result[valid] = self.section_grid[indices[valid, 0], indices[valid, 1]]
+        return result[0] if single else result
+
+    def CountFootholds(self, B_points: np.ndarray, feasible_mask: np.ndarray
+                       ) -> Tuple[np.ndarray, list[np.ndarray]]:
+        """按方向及已有可行分支掩码统计，返回 (N,2) 标签和两个分支计数数组。"""
+        points, _ = self._AsPoints(B_points)
+        mask = np.asarray(feasible_mask, dtype=bool)
+        if mask.shape != (len(points), 2):
+            raise ValueError("feasible_mask must have shape (N,2)")
+        sections = self.Pos2Section(points)
+        sections[~mask] = -1
+        counts = []
+        for branch in range(2):
+            ids = sections[:, branch]
+            counts.append(np.bincount(
+                ids[ids >= 0], minlength=int(self.section_count[branch])
+            ))
+        return sections, counts
+
+
 class LegVoxels(Voxels):
-    """腿部体素独有的数据 关节逆运动学解，关节位置，末端关节x朝向，可行腿"""
+    """腿部体素独有的数据 关节逆运动学解，关节位置，末端关节x朝向，可行腿
+       六条腿分别创建方向栅格 SphereVoxels"""
     def __init__(
         self,
         kinematic: Kinematic,
         xyz_range=[[-0.14, 0.3], [-0.3, 0.3], [-0.27, 0.2]],
-        voxel_scale: float = 0.005
+        voxel_scale: float = 0.005,
+        sphere_scale: float = np.deg2rad(1.0)  # 弧度，默认对应 1°
     ):
         self.kin = kinematic
         super().__init__(np.array(xyz_range),voxel_scale)
@@ -289,11 +430,16 @@ class LegVoxels(Voxels):
         self.solution_num = np.zeros((self.grid_size,), dtype=np.uint8)
         self.reachable_legs = None #grid_size 解的数量 6个腿 solve all中有定义
         self.joints = np.full((self.grid_size, max_sol, 3), np.nan, dtype=np.float32)
+        self.mechanical_margin = np.full(self.grid_size, np.nan, dtype=np.float32)
         self.x_b3 = np.full((self.grid_size, max_sol, 3), np.nan, dtype=np.float32)
         # self.knee_pos = np.full((self.grid_size, max_sol, 3), np.nan, dtype=np.float32)
         self.ankle_pos = np.full((self.grid_size, max_sol, 3),np.nan, dtype=np.float32)
         self.ankle_collide_radi = 0.045 #ankle关节碰撞圆的半径
-
+        #球体素，给每个腿都创建一个
+        self.sphere_voxels_list:list[SphereVoxels]=[]
+        for i in range(6):
+            bounds = np.vstack([self.kin.joints_limits_thigh[i],[-np.pi/2,np.pi/2]])
+            self.sphere_voxels_list.append(SphereVoxels(bounds,sphere_scale))
         #[LB:[0,1,2,3],LF:[3,4,5,6],[],[]]
         self._leg_names=["LB","LF","LM","RB","RF","RM"]
         self.leg_feasi_voxel_index=[]
@@ -373,6 +519,82 @@ class LegVoxels(Voxels):
         for i in range(6):
             self.leg_feasi_voxel_index.append(np.where(leg_valid[:,i])[0])
 
+        self.ComputeMechanicalMargin()
+
+    def ComputeMechanicalMargin(self) -> None:
+        """由已求解的 joints 计算精确最弱承载力，单位 N。
+
+        仅考虑 foot 原点受力及 thigh/knee/ankle 各27 N·m的扭矩限制，
+        不计初始载荷、自重或接触约束。M = 27 / max_j ||J_j||。
+        当前机构两个肘部 IK 分支的理论值相同，每个位置选择第一个
+        有限解计算并保存一个值；没有有限解的位置保留 NaN。
+        不从足端位置重新推算角度，各腿可达性由已有掩码独立判断。
+        推导见 docs/leg_mechanical_margin.md。
+        """
+        self.mechanical_margin = np.full(self.grid_size, np.nan, dtype=np.float32)
+        valid = np.isfinite(self.joints).all(axis=2)
+        rows = np.flatnonzero(valid.any(axis=1))
+        branches = np.argmax(valid[rows], axis=1)
+        for start in range(0, rows.size, 4096):
+            batch_rows = rows[start:start + 4096]
+            batch_branches = branches[start:start + 4096]
+            joints = self.joints[batch_rows, batch_branches].astype(np.float64)
+            jacobian = self.kin.Jacobian(joints)
+            max_arm = np.max(np.linalg.norm(jacobian, axis=1), axis=1)
+            margin = np.full(max_arm.shape, np.inf, dtype=np.float64)
+            np.divide(27.0, max_arm, out=margin, where=max_arm != 0.0)
+            self.mechanical_margin[batch_rows] = margin
+
+
+    def plot_leg_voxels(self, leg_index: int) -> None:
+        """在腿部 B 系中按力学裕量着色显示指定腿的可达体素。
+
+        索引0～5对应 LB、LF、LM、RB、RF、RM。只使用本类的
+        reachable_legs，不额外检查身体碰撞，不重新计算或保存数据。
+        """
+        if isinstance(leg_index, (bool, np.bool_)) or not isinstance(leg_index, (int, np.integer)):
+            raise TypeError("leg_index must be an integer in [0, 5]")
+        if not 0 <= leg_index < len(self._leg_names):
+            raise ValueError("leg_index must be in [0, 5]")
+        if self.reachable_legs is None:
+            raise RuntimeError("Call SolveAllVoxels() or BuildFromFile() before plotting leg voxels")
+
+        visible = self.reachable_legs[:, :, leg_index].any(axis=1) & np.isfinite(self.mechanical_margin)
+        # visible &= self.mechanical_margin>=80.0
+        leg_name = self._leg_names[leg_index]
+        if not visible.any():
+            print(f"No reachable voxels with finite mechanical margin for leg {leg_index} ({leg_name})")
+            return
+
+        cloud = pv.PolyData(self.center[visible])
+        cloud["mechanical_margin"] = self.mechanical_margin[visible]
+        plotter = pv.Plotter()
+        plotter.add_mesh(
+            cloud,
+            scalars="mechanical_margin",
+            cmap="viridis",
+            clim=(60, int(np.ceil(27.0 / self.kin.l3))),
+            render_points_as_spheres=True,
+            point_size=20,
+            opacity=0.4,
+            scalar_bar_args={
+                # "title": "Mechanical margin (N)",
+                "fmt": "%.0f",
+                "vertical": True,
+                "position_x": 0.82,
+                "position_y": 0.15,
+                "width": 0.06,
+                "height": 0.50,
+                "title_font_size": 42,
+                "label_font_size": 42,
+                "unconstrained_font_size": True,
+            },
+        )
+        plotter.add_mesh(pv.PolyData(np.array([0.145,0,0])),point_size=30,render_points_as_spheres=True)
+        # plotter.add_text(f"Leg {leg_index} ({leg_name}) - B frame", font_size=32)
+        plotter.show_axes()
+        plotter.show_grid(xtitle="B x (m)", ytitle="B y (m)", ztitle="B z (m)")
+        plotter.show()
 
     def WriteFile(self,dir_path:str):
         """dir_path代表文件夹路径"""
@@ -383,6 +605,7 @@ class LegVoxels(Voxels):
                  ankle_pos=self.ankle_pos,
                  x_b3=self.x_b3,
                  reachable_legs=self.reachable_legs,
+                 mechanical_margin=self.mechanical_margin,
                  )
         print("--------->save leg voxels info to "+os.path.join(dir_path,"leg_voxels_info.npz"))
 
@@ -397,6 +620,12 @@ class LegVoxels(Voxels):
                 self.ankle_pos = leg_voxels_info["ankle_pos"]
                 self.x_b3 = leg_voxels_info["x_b3"]
                 self.reachable_legs = leg_voxels_info["reachable_legs"]
+                if ("mechanical_margin" in leg_voxels_info
+                        and leg_voxels_info["mechanical_margin"].shape == (self.grid_size,)):
+                    self.mechanical_margin = leg_voxels_info["mechanical_margin"].astype(np.float32)
+                else:
+                    # Older caches store sampled margins per IK branch.
+                    self.ComputeMechanicalMargin()
             for i in range(6):
                 self.leg_feasi_voxel_index.append(np.where(self.reachable_legs[...,i].any(axis=1)))
             print("-------->build leg voxels from file")
@@ -413,7 +642,8 @@ class BodyVoxels(Voxels):
         # 这个STL文件用于检查腿部和身体的碰撞，只把身体和knee关节包络其中，供ankle和end检查，knee通过角度限制确保了不会碰撞
         body_mesh_for_leg:trimesh.Trimesh= trimesh.load_mesh(LEGGED_GYM_ROOT_DIR+"/resources/robots/hex_v4/body_leg_collision.STL") 
         #这个STL文件把身体在水平方向扩张一直到ankle关节，用于和环境检查是否碰撞，可以为ankle摆动预留空间
-        body_mesh_for_env:trimesh.Trimesh= trimesh.load_mesh(LEGGED_GYM_ROOT_DIR+"/resources/robots/hex_v4/body_extend_collision.STL")
+        # "/home/val/BIH_ws/legged_gym/resources/robots/"
+        body_mesh_for_env:trimesh.Trimesh= trimesh.load_mesh(LEGGED_GYM_ROOT_DIR+"/resources/robots/hex_magnetic/body_env_collision.STL")
         if isinstance(body_mesh_for_leg,trimesh.Scene):
             body_mesh_for_leg = trimesh.util.concatenate(tuple(body_mesh_for_leg.geometry.values()))
         if isinstance(body_mesh_for_env,trimesh.Scene):
@@ -501,12 +731,13 @@ class RoboVoxels:
     """包含了机器人腿部和身体的体素"""
     def __init__(self,
                  kinematic:Kinematic,
-                 leg_xyz_range=[[-0.14, 0.38], [-0.38, 0.38], [-0.27, 0.25]], #在腿部B坐标系下
+                 leg_xyz_range=[[-0.14, 0.38], [-0.38, 0.38], [-0.4, 0.4]], #在腿部B坐标系下
                  body_xyz_range=[[-0.4, 0.4], [-0.5, 0.5], [-0.2, 0.2]],#载身体R坐标系下
-                 voxel_scale = 0.01 #腿和身体采用同样大小的体素
+                 voxel_scale = 0.01, #腿和身体采用同样大小的体素
+                 sphere_scale: float = np.deg2rad(1.0)  # 弧度，默认对应 1°
                  ):
         self.kin = kinematic
-        self.leg_voxels = LegVoxels(kinematic,leg_xyz_range,voxel_scale)
+        self.leg_voxels = LegVoxels(kinematic,leg_xyz_range,voxel_scale,sphere_scale)
         self.body_voxels = BodyVoxels(body_xyz_range,voxel_scale)
         #考虑身体体素后，腿部部分空间可能不能达到，因此在这里定义新的reachable_legs属性
         # leg_grid_size, 2, 6
@@ -613,10 +844,10 @@ class RoboVoxels:
         plotter = pv.Plotter()
         plotter.show_axes()
         flat_index = np.where(self.body_voxels.esdf_flat_for_leg<=0)
-        plotter.add_mesh(pv.PolyData(self.body_voxels.center[flat_index]),render_points_as_spheres=True,point_size=20,color='red')
+        plotter.add_mesh(pv.PolyData(self.body_voxels.center[flat_index]),render_points_as_spheres=True,point_size=20,color='green')
 
         flat_index = np.where(self.body_voxels.esdf_flat_for_env<=0)
-        plotter.add_mesh(pv.PolyData(self.body_voxels.center[flat_index]),render_points_as_spheres=True,point_size=20,color='green',opacity=0.2)        
+        plotter.add_mesh(pv.PolyData(self.body_voxels.center[flat_index]),render_points_as_spheres=True,point_size=20,color='green',opacity=0.4)
 
         #绘制身体STL
         # body_mesh_for_leg = self.body_voxels.body_mesh_for_leg
@@ -633,7 +864,7 @@ class RoboVoxels:
 
         # points = pv.PolyData(np.array([[0,0,-0.09],[0.23,0.513,0]]))
         # plotter.add_mesh(points,render_points_as_spheres=True,point_size=50,color='red')
-        color_list=["red","green","blue","yellow","gray","cyan"]
+        color_list=["red","purple","blue","yellow","gray","cyan"]
         for i in range(6):
             # if i==1 or i==5:
             # reachable = (self.leg_voxels.reachable_legs[...,i]).any(axis=1) #leg_grid_size
@@ -648,10 +879,12 @@ class RoboVoxels:
             #此处绘制的是腿部和身体esdf_for_leg检查后的工作空间
             reachable = (self.robot_reachable_legs[...,i]).any(axis=1) #leg_grid_size
             cloud = pv.PolyData(self.kin._B2R( self.leg_voxels.center[reachable].T ,i).T)
-            plotter.add_mesh(cloud,render_points_as_spheres=True,point_size=20,color=color_list[i],opacity=0.2)
+            plotter.add_mesh(cloud,render_points_as_spheres=True,point_size=20,color=color_list[i],opacity=0.4)
             # stance_inside = (self.to_bound_dist_flat[...,i]>=0.04)
             # cloud = pv.PolyData(self.kin._B2R(self.leg_voxels.center[stance_inside].T,i).T)
             # plotter.add_mesh(cloud,render_points_as_spheres=True,point_size=20,color=color_list[i])
+        plotter.show_grid(xtitle="R x (m)", ytitle="R y (m)", ztitle="R z (m)")
+
         plotter.show()
 
 class HexState:
@@ -661,14 +894,13 @@ class HexState:
     2. 点是否在对应的腿部空间内
     3. 给定起点和方向，获得在腿部工作空间内，从起点沿方向最远的点
     4. 整体轨迹规划和摆动腿部的轨迹规划方法"""
-    def __init__(self,kinematic:Kinematic):
+    def __init__(self,kinematic:Kinematic,sphere_scale:float=np.deg2rad(1.0)):
         self.kin = kinematic
-        self.robot_voxels = RoboVoxels(kinematic=self.kin)
+        self.robot_voxels = RoboVoxels(kinematic=self.kin,sphere_scale=sphere_scale)
         self.env_pointsmap_voxels = EnvPointsVoxels(
         # LEGGED_GYM_ROOT_DIR+"/resources/environments/sutructure1/complex_surface_point_map.npz")
         # LEGGED_GYM_ROOT_DIR+"/resources/environments/structure2/regular_dodecagon_point_map.npz")
         LEGGED_GYM_ROOT_DIR+"/resources/environments/structure2/complex_surface3_point_map.npz")
-        
 
     def _LegNormFeasi(self,R_points:np.ndarray,R_normals:np.ndarray,leg_index:Union[np.ndarray|int]):
         """检查这一点是否法向量可行, 先检查这一点法向量与腿部连杆所在平面的夹角是否在范围内，再选出两个解中哪一个解的x_b3可行
@@ -789,6 +1021,96 @@ class HexState:
         ankle_free_mask = ankle_free_mask.reshape(-1,2)
 
         return end_free_mask&ankle_free_mask
+
+    def _LegConnections(self, W_T_R: SE3, leg_index: int, *,
+                        safe_radius: float = 0.145, max_radius: float | None = None,
+                        radial_step: float | None = None) -> SphereVoxels:
+        """批量检查径向带，仅将整段采样都有效的方向纳入连通分区。
+
+        max_radius 默认 safe_radius + 0.03 m。一次构造所有半径/方向的点，
+        用前缀逻辑与保留首次失败前的上界，失败后不恢复。只依赖现有
+        机器人、ankle 和足端碰撞模型，不验证角向运动，不写离线缓存。
+        """
+        if (isinstance(leg_index, (bool, np.bool_))
+                or not isinstance(leg_index, (int, np.integer)) or not 0 <= leg_index < 6):
+            raise ValueError("leg_index must be an integer in [0,5]")
+        leg = self.robot_voxels.leg_voxels
+        step = float(leg.voxel_scale if radial_step is None else radial_step)
+        safe_radius = float(safe_radius)
+        max_radius = safe_radius + 0.03 if max_radius is None else float(max_radius)
+        if (not np.isfinite([safe_radius, max_radius, step]).all()
+                or safe_radius <= 0 or max_radius < safe_radius or step <= 0):
+            raise ValueError("require 0 < safe_radius <= max_radius and radial_step > 0")
+
+        table = leg.sphere_voxels_list[leg_index]
+        table.radius_grid.fill(-np.inf)
+        table.section_grid.fill(-1)
+        table.section_count.fill(0)
+        table.safe_radius = safe_radius
+        table.required_radius = max_radius
+        count = int(np.floor((max_radius - safe_radius) / step))
+        radii = safe_radius + np.arange(count + 1) * step
+        if np.isclose(radii[-1], max_radius, rtol=0, atol=1e-12):
+            radii[-1] = max_radius
+        else:
+            radii = np.append(radii, max_radius)
+
+        # 顺序为 [半径, 展平的方向, xyz]；各层一起检查，无半径层循环。
+        points = (radii[:, None, None] * table.directions[None, :, :]).reshape(-1, 3)
+        free = np.zeros((len(points), 2), dtype=bool)
+        inside = leg.IsInsideRange(points) & np.isfinite(points).all(axis=1)
+        env = self.env_pointsmap_voxels.voxels
+        if inside.any():
+            inside_rows = np.flatnonzero(inside)
+            checked_points = points[inside]
+            flat = leg.Pos2FlatIndex(checked_points)
+            # 原碰撞函数采用体素中心处的末端/IK 数据；两种末端位置均需
+            # 在环境范围内，避免把越界采样或 ankle 裁剪到边界后误判。
+            end_world = (W_T_R * self.kin._B2R(leg.center[flat].T, leg_index)).T
+            sample_world = (W_T_R * self.kin._B2R(checked_points.T, leg_index)).T
+            ankle = leg.ankle_pos[flat]
+            ankle_world = (W_T_R * self.kin._B2R(
+                ankle.reshape(-1, 3).T, leg_index
+            )).T
+            branch_valid = (
+                np.isfinite(leg.joints[flat]).all(axis=2)
+                & np.isfinite(ankle).all(axis=2)
+                & env.IsInsideRange(ankle_world).reshape(-1, 2)
+                & env.IsInsideRange(end_world)[:, None]
+                & env.IsInsideRange(sample_world)[:, None]
+            )
+            usable = branch_valid.any(axis=1)
+            if usable.any():
+                free[inside_rows[usable]] = branch_valid[usable] & self._LegEnvCollisionFree(
+                    checked_points[usable], W_T_R, leg_index,
+                    ignore_ankle=False, ignore_end=False,
+                )
+
+        prefix = np.logical_and.accumulate(
+            free.reshape(len(radii), table.grid_size, 2), axis=0
+        )
+        prefix_length = prefix.sum(axis=0)
+        last_radius = radii[np.maximum(prefix_length - 1, 0)]
+        table.radius_grid[...] = np.where(
+            prefix_length > 0, last_radius, -np.inf
+        ).reshape(table.radius_grid.shape)
+
+        table.LabelSections()
+        return table
+
+    def BuildRobotConnections(self, W_T_R: SE3, *, safe_radius: float = 0.145,
+                              max_radius: float | None = None,
+                              radial_step: float | None = None) -> list[SphereVoxels]:
+        """按当前机身位姿重建六张方向表；返回对象在下次构建时会被原位更新。
+
+        默认检查从 safe_radius 到 safe_radius + 3 cm 的整段径向采样。
+        与 RobotFeasiCheck 独立调用。其落脚点转换到每条腿的 B 系后，可用
+        CountFootholds(points, feasible_mask) 按方向统计，不比较落脚点半径。
+        """
+        return [self._LegConnections(
+            W_T_R, i, safe_radius=safe_radius, max_radius=max_radius,
+            radial_step=radial_step,
+        ) for i in range(6)]
 
     def RobotFeasiCheck(self,W_T_R:SE3,points_idx:Union[None|np.ndarray]=None)->Tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray]:
         """
