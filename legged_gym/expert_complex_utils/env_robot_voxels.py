@@ -640,7 +640,7 @@ class BodyVoxels(Voxels):
         super().__init__(np.array(xyz_range),voxel_scale)
         #构建身体-腿部碰撞部分,从STL文件中读取，构建封闭几何体
         # 这个STL文件用于检查腿部和身体的碰撞，只把身体和knee关节包络其中，供ankle和end检查，knee通过角度限制确保了不会碰撞
-        body_mesh_for_leg:trimesh.Trimesh= trimesh.load_mesh(LEGGED_GYM_ROOT_DIR+"/resources/robots/hex_v4/body_leg_collision.STL") 
+        body_mesh_for_leg:trimesh.Trimesh= trimesh.load_mesh(LEGGED_GYM_ROOT_DIR+"/resources/robots/hex_magnetic/body_leg_collision.STL") 
         #这个STL文件把身体在水平方向扩张一直到ankle关节，用于和环境检查是否碰撞，可以为ankle摆动预留空间
         # "/home/val/BIH_ws/legged_gym/resources/robots/"
         body_mesh_for_env:trimesh.Trimesh= trimesh.load_mesh(LEGGED_GYM_ROOT_DIR+"/resources/robots/hex_magnetic/body_env_collision.STL")
@@ -650,6 +650,9 @@ class BodyVoxels(Voxels):
             body_mesh_for_env = trimesh.util.concatenate(tuple(body_mesh_for_env.geometry.values()))
         self.body_mesh_for_leg = body_mesh_for_leg
         self.body_mesh_for_env = body_mesh_for_env
+
+
+
 
     def BuildBodyAllVoxels(self):
         """
@@ -674,6 +677,10 @@ class BodyVoxels(Voxels):
         self.esdf_flat_for_leg = self.esdf_for_leg.ravel()
         self.esdf_flat_for_env = self.esdf_for_env.ravel()
 
+        #在身体表面采样的点
+        points,_= trimesh.sample.sample_surface(self.body_mesh_for_env,512)
+        # print("STL sample points shape=",np.asarray(points).shape)
+        self.bounding_points = np.asarray(points)
         # plotter = pv.Plotter()
         # body_cloud = pv.PolyData(self.center[inside_center_mask])
         # plotter.add_mesh(body_cloud,render_points_as_spheres=True,point_size=30)
@@ -683,7 +690,8 @@ class BodyVoxels(Voxels):
         """dir_path代表文件夹路径"""
         np.savez(os.path.join(dir_path,"body_voxels_info.npz"), 
                  esdf_for_leg=self.esdf_for_leg,
-                 esdf_for_env=self.esdf_for_env
+                 esdf_for_env=self.esdf_for_env,
+                 bounding_points=self.bounding_points
                  )
         
         print(f"--------->save body voxels info to "+os.path.join(dir_path,"body_voxels_info.npz"))        
@@ -696,7 +704,8 @@ class BodyVoxels(Voxels):
                 self.esdf_for_leg = body_voxels_info["esdf_for_leg"]
                 self.esdf_flat_for_leg = self.esdf_for_leg.ravel()
                 self.esdf_for_env = body_voxels_info["esdf_for_env"]
-                self.esdf_flat_for_env = self.esdf_for_env.ravel()                
+                self.esdf_flat_for_env = self.esdf_for_env.ravel()
+                self.bounding_points = body_voxels_info["bounding_points"]                
             print("---------->Build body voxels from file")
             return True
         else:
@@ -711,21 +720,41 @@ class EnvPointsVoxels(PointMap):
         super().__init__(cloud_file)
         """@input cloud_file 点云的原始文件位置
         """
+        voxel_file = os.path.join(f"{EXPERT_COMPLEX_DIR}/voxels_info/env_voxels.npz")
         self.voxels = Voxels(self._bounds,voxel_scale)
+        self.env_esdf = None
+        self.env_esdf_flat = None
+        if not self.ReadEnvVoxels(voxel_file):
+            print("------------>Build env esdf form point map")
+            self.env_esdf = self.BuildESDF(voxel_scale,voxel_file)
+            self.env_esdf_flat = self.env_esdf.ravel()
+
+    def __enter__(self)->EnvPointsVoxels:
+        """方便 with self.hex_state.env_pointsmap_voxels as pointmap:
+        此时能推断出 pointmap的类型"""
+        return self
+    def ReadEnvVoxels(self,file):
+        # env_info_file = os.path.join(f"{EXPERT_COMPLEX_DIR}/voxels_info/env_voxels.npz")
+        if os.path.exists(file):
+            with np.load(file) as env_info:
+                self.env_esdf = env_info["esdf"]
+                self.env_esdf_flat = self.env_esdf.ravel()
+                print("---------->Build env voxels from file")
+            return True
+        else:
+            return False
+    def BuildESDF(self,voxel_scale,file)->np.ndarray:
         #构建ESDF地图
         ix,iy,iz = self.voxels.Pos2GridIndex(self.points).T
         env_occ = np.zeros(self.voxels.grid_shape,dtype=bool)
         env_occ[ix,iy,iz] = True
         dist_out = distance_transform_edt(~env_occ,sampling=voxel_scale)
         dist_in  = distance_transform_edt(env_occ,sampling=voxel_scale)
-        self.env_esdf:np.ndarray = (dist_out - dist_in).astype(np.float32)
-
-        self.env_esdf_flat = self.env_esdf.ravel()
-
-    def __enter__(self)->EnvPointsVoxels:
-        """方便 with self.hex_state.env_pointsmap_voxels as pointmap:
-        此时能推断出 pointmap的类型"""
-        return self
+        env_esdf:np.ndarray = (dist_out - dist_in).astype(np.float32)
+        np.savez(file,
+                 esdf=env_esdf)
+        print("--------->save env voxels info to "+file)
+        return env_esdf
 
 class RoboVoxels:
     """包含了机器人腿部和身体的体素"""
@@ -849,6 +878,10 @@ class RoboVoxels:
         flat_index = np.where(self.body_voxels.esdf_flat_for_env<=0)
         plotter.add_mesh(pv.PolyData(self.body_voxels.center[flat_index]),render_points_as_spheres=True,point_size=20,color='green',opacity=0.4)
 
+        plotter.add_mesh(pv.PolyData(self.body_voxels.bounding_points),
+                         render_points_as_spheres=True,
+                         point_size=20,
+                         color='blue',opacity=0.8)
         #绘制身体STL
         # body_mesh_for_leg = self.body_voxels.body_mesh_for_leg
         # faces = np.column_stack([
@@ -969,8 +1002,10 @@ class HexState:
         if not ignore_ankle:
             ankle_pos =np.nan_to_num( self.robot_voxels.leg_voxels.ankle_pos[flat_index].reshape(-1,3), nan=0.0)
             ankle_pos = (W_T_R*self.robot_voxels.kin._B2R(ankle_pos.T,leg_index)).T #batch_size*2,3
-            ix,iy,iz = self.env_pointsmap_voxels.voxels.Pos2GridIndex(ankle_pos).T
-            ankle_free_mask = (self.env_pointsmap_voxels.env_esdf[ix,iy,iz]>=
+            ankle_distance = self.env_pointsmap_voxels.voxels.TrilinearSample(
+                self.env_pointsmap_voxels.env_esdf,ankle_pos,outside_value=-0.06
+            )
+            ankle_free_mask = (ankle_distance>=
                                 self.robot_voxels.leg_voxels.ankle_collide_radi).reshape(-1,2)
         else:
             ankle_free_mask = np.ones_like(reachable_mask,dtype=bool)
@@ -1172,9 +1207,10 @@ class HexState:
             B_points = B_points[inside_leg_mask] #N,3
             #筛选在当前腿部可行工作范围内 不仅要求有可行解 同时不能距离腿部基坐标的距离超过30cm
             _flat_index = self.robot_voxels.leg_voxels.Pos2FlatIndex(B_points)
-            # inside_leg_range_mask = self.robot_voxels.robot_reachable_legs[_flat_index,:,i] #N,2
-            # inside_leg_range_mask = self.robot_voxels.to_bound_dist_flat[_flat_index,i]>=0.042 #N
-            inside_leg_range_mask = self.robot_voxels.to_bound_dist_flat[_flat_index,i]>=0.04 #N
+            boundary_distance = self.robot_voxels.leg_voxels.TrilinearSample(
+                self.robot_voxels.to_bound_dist[...,i],B_points,outside_value=0.0
+            )
+            inside_leg_range_mask = boundary_distance>=0.04 #N
             # N,2 & N,1 -> N,2
             inside_leg_range_mask &= (np.linalg.norm(self.robot_voxels.leg_voxels.center[_flat_index],axis=1)<=0.3)
 
@@ -1203,14 +1239,11 @@ class HexState:
             return np.zeros(0,dtype=np.int64)
         _,idx = self.env_pointsmap_voxels._tree.query(W_T_R.t,k=query_num)
         idx = np.asarray(idx,dtype=np.int64).reshape(-1)
-        # Optimize会固定points_idx，因此RobotFeasiCost内部基于points_idx is None
-        # 的landing fallback不会触发。这里直接把最近landing点并入固定集合，
-        # 避免出现腿部代价很高但完全没有落脚点梯度的情况。
-        landing_count = self.env_pointsmap_voxels.landing_points.shape[0]
-        landing_query_num = min(100,landing_count)
-        if landing_query_num>0:
+        # 在候选集合固定前补充落脚点；轮内代价求值只重新评分和择优。
+        landing_count = self.env_pointsmap_voxels.landing_count
+        if np.count_nonzero(idx<landing_count)<=60 and landing_count>0:
             _,landing_idx = self.env_pointsmap_voxels._landing_tree.query(
-                W_T_R.t,k=landing_query_num
+                W_T_R.t,k=min(100,landing_count)
             )
             idx = np.unique(np.concatenate([
                 idx,np.asarray(landing_idx,dtype=np.int64).reshape(-1)
@@ -1221,275 +1254,217 @@ class HexState:
         self,
         W_T_R:SE3,
         points_idx:Union[None|np.ndarray]=None,
-        smooth_temperature:float=0.05,
+        sol_index:int=1,
     )->float:
-        """
-        计算单个机器人位姿的身体碰撞与腿部落脚可行性代价。
+        """计算身体碰撞、每腿硬可行点数量和最优六个落脚候选的代价。
 
-        腿部只评估落在 LegVoxels bounds 内的落脚点。工作空间和足端
-        距离是分支无关项；法向、IK 有效性和 ankle 碰撞是分支相关项。
-        每个候选点选择两个 IK 分支中得分较高者，每条腿再选择得分最高的
-        若干候选点计算代价。返回值越小代表位姿越可行。
+        身体使用固定的 R 系 STL 表面采样点，在世界系环境 ESDF 中查询
+        距离。腿部使用 ``points_idx`` 中的 landing_points，按指定分支
+        查表得到可达性、x_b3 和 ankle。30 cm 外使用超出半径的代价，
+        30 cm 内使用 to_bound_dist 插值距离不足 4 cm 的代价；再加上
+        法向和 ankle 软代价，每次调用重新选择最低分的最多六个点取平均；
+        硬可行点不足六个时，另加缺少数量的平方代价。
+
+        ``sol_index`` 是全部六条腿共用的 IK 分支索引，只能为 0 或 1。
         """
-        body_safe_margin = 0.01
-        body_distance_scale = 0.005
-        body_top_k = 20
+        if (
+            isinstance(sol_index,(bool,np.bool_))
+            or int(sol_index)!=sol_index
+            or sol_index not in (0,1)
+        ):
+            raise ValueError("sol_index must be 0 or 1")
+        sol_index = int(sol_index)
+
+        body_safe_margin = 0.08
         body_weight = 10.0
+        max_leg_radius = 0.28
+        leg_boundary_margin = 0.05
+        workspace_distance_scale = 0.03
+        plane_angle_limit = np.deg2rad(15.0)
+        xb3_angle_limit = np.deg2rad(80.0)
+        xb3_transition = np.deg2rad(10.0)
+        ankle_safe_margin = 0.06
+        best_point_count = 6
+        plane_max_cost = ((np.pi/2.0-plane_angle_limit)/plane_angle_limit)**2
+        eps = 1e-8
 
-        workspace_safe_margin = 0.042
-        max_leg_radius = 0.30
-        distance_score_scale = 0.01
-        normal_score_scale = 0.05
-        candidate_top_k = 6  # 可根据实际候选点密度改为 10
-        missing_candidate_score = -10.0
-        leg_weight = 1.0
-
-        if smooth_temperature<=0.0:
-            raise ValueError("smooth_temperature must be positive")
-
-        def _Softplus(value:np.ndarray)->np.ndarray:
-            return np.logaddexp(0.0,value)
-
-        def _SmoothMin(left:np.ndarray,right:np.ndarray)->np.ndarray:
-            left = np.asarray(left,dtype=np.float64)
-            right = np.asarray(right,dtype=np.float64)
-            return -smooth_temperature*np.logaddexp(
-                -left/smooth_temperature,-right/smooth_temperature
-            )
-
-        def _SmoothMax(values:np.ndarray,axis:int)->np.ndarray:
-            values = np.asarray(values,dtype=np.float64)
-            max_value = np.max(values,axis=axis,keepdims=True)
-            result = max_value+smooth_temperature*np.log(
-                np.sum(
-                    np.exp((values-max_value)/smooth_temperature),
-                    axis=axis,
-                    keepdims=True,
-                )
-            )
-            return np.squeeze(result,axis=axis)
-
-        def _TopKMean(values:np.ndarray,k:int)->float:
-            values = np.asarray(values,dtype=np.float64).reshape(-1)
-            if values.size == 0:
-                return 0.0
-            k = min(int(k),values.size)
-            return float(np.mean(np.partition(values,values.size-k)[-k:]))
-
-        # 查询当前身体附近的环境点。
-        if points_idx is None:
-            idx = self.GetRobotFeasiCostPoints(W_T_R)
-        else:
-            idx = points_idx
-        idx = np.asarray(idx,dtype=np.int64).reshape(-1)
-
-        near_env_points = (W_T_R.inv()*self.env_pointsmap_voxels.points[idx].T).T
-
-        # 身体ESDF采用三线性插值。范围外给一个足够安全的距离，避免体素
-        # floor查询造成大面积零梯度，也避免候选点进出bounds时突然跳变。
-        if near_env_points.shape[0]>0:
-            body_voxels = self.robot_voxels.body_voxels
-            body_distance = body_voxels.TrilinearSample(
-                body_voxels.esdf_for_env,
-                near_env_points,
-                outside_value=body_safe_margin+10.0*body_distance_scale,
-            )
-            body_violation = _Softplus(
-                (body_safe_margin-body_distance)/body_distance_scale
-            )**2
-            body_cost = _TopKMean(body_violation,body_top_k)
-        else:
-            body_cost = 0.0
-
-        # 取得当前位姿附近的落脚点候选。
-        possible_landing_mask = idx<self.env_pointsmap_voxels.landing_count
-        landing_point_num = self.env_pointsmap_voxels.landing_points.shape[0]
-        if landing_point_num==0:
-            possible_landing_idx = np.zeros(0,dtype=np.int64)
-        elif np.sum(possible_landing_mask)<=60 and points_idx is None:
-            landing_query_num = min(
-                100,landing_point_num
-            )
-            _,possible_landing_idx = self.env_pointsmap_voxels._landing_tree.query(
-                W_T_R.t,k=landing_query_num
-            )
-        else:
-            possible_landing_idx = idx[possible_landing_mask]
-        possible_landing_idx = np.asarray(possible_landing_idx,dtype=np.int64).reshape(-1)
-
-        near_landing_points = self.env_pointsmap_voxels.landing_points[possible_landing_idx].T
-        near_landing_normals = self.env_pointsmap_voxels.normals[possible_landing_idx].T
-        near_landing_points = (W_T_R.inv() * near_landing_points).T #landing_num,3
-        near_landing_normals = (W_T_R.R.T @ near_landing_normals).T #landing_num,3
-
-        leg_costs = np.zeros(6,dtype=np.float64)
-        cos_plane_limit = np.cos(np.deg2rad(75.0))
-        cos_branch_limit = np.cos(np.deg2rad(95.0))
-        leg_voxels = self.robot_voxels.leg_voxels
+        body_voxels = self.robot_voxels.body_voxels
         env_voxels = self.env_pointsmap_voxels.voxels
 
-        def _OutsideWorkspaceScores(
-            all_B_points:np.ndarray,
-            inside_leg_mask:np.ndarray,
-            leg_index:int,
-            select_num:int,
-        )->np.ndarray:
-            """按扩展to_bound_dist选择最接近腿工作空间的范围外环境点。"""
-            outside_points = all_B_points[~inside_leg_mask]
-            if select_num<=0 or outside_points.shape[0]==0:
-                return np.zeros(0,dtype=np.float64)
-            center_min = leg_voxels._bounds[:,0]+0.5*leg_voxels.voxel_scale
-            center_max = (
-                leg_voxels._bounds[:,0]
-                +(leg_voxels.grid_shape-0.5)*leg_voxels.voxel_scale
+        # 身体碰撞：R 系 STL 表面采样点变换到世界系后，直接查询环境 ESDF。
+        bounding_points_R = np.asarray(
+            body_voxels.bounding_points,dtype=np.float64
+        ).reshape(-1,3)
+        if bounding_points_R.shape[0] == 0:
+            body_cost = 0.0
+        else:
+            bounding_points_W = (W_T_R*bounding_points_R.T).T
+            body_distance = env_voxels.TrilinearSample(
+                self.env_pointsmap_voxels.env_esdf,
+                bounding_points_W,
+                outside_value=-body_safe_margin,
             )
-            boundary_points = np.clip(outside_points,center_min,center_max)
-            boundary_distance = leg_voxels.TrilinearSample(
-                self.robot_voxels.to_bound_dist[...,leg_index],
-                boundary_points,
-                outside_value=-10.0*distance_score_scale,
+            body_violation = np.maximum(
+                0.0,
+                (body_safe_margin-np.asarray(body_distance,dtype=np.float64))
+                /body_safe_margin,
             )
-            # 将体素范围内的有符号距离向外延拓；越接近可行域，值越大。
-            extended_distance = boundary_distance-np.linalg.norm(
-                outside_points-boundary_points,axis=1
-            )
-            radial_margin = max_leg_radius-np.linalg.norm(outside_points,axis=1)
-            outside_scores = _SmoothMin(
-                (extended_distance-workspace_safe_margin)/distance_score_scale,
-                radial_margin/distance_score_scale,
-            )
-            select_num = min(select_num,outside_scores.size)
-            selected_index = np.argpartition(
-                extended_distance,extended_distance.size-select_num
-            )[-select_num:]
-            return outside_scores[selected_index]
+            body_cost = float(np.mean(body_violation**2))
+
+        # landing_points 与 points 的前 landing_count 个索引对应，已经包含
+        # 吸盘到足端的法向偏移。blocked 表面点不参与腿部数量和评分。
+        if points_idx is None:
+            points_idx = self.GetRobotFeasiCostPoints(W_T_R)
+        points_idx = np.unique(np.asarray(points_idx,dtype=np.int64).reshape(-1))
+        landing_idx = points_idx[
+            (points_idx>=0)&(points_idx<self.env_pointsmap_voxels.landing_count)
+        ]
+        W_points = self.env_pointsmap_voxels.landing_points[landing_idx]
+        W_normals = self.env_pointsmap_voxels.normals[landing_idx]
+        R_points = (W_T_R.inv()*W_points.T).T
+        R_normals = (W_T_R.R.T@W_normals.T).T
+
+        leg_voxels = self.robot_voxels.leg_voxels
+        leg_costs = np.zeros(6,dtype=np.float64)
+        z_axis = np.array([0.0,0.0,1.0],dtype=np.float64)
+        worst_point_cost = None
 
         for leg_index in range(6):
-            all_B_points = self.kin._R2B(near_landing_points.T,leg_index).T
-            inside_leg_mask = leg_voxels.IsInsideRange(all_B_points)
-            B_points = all_B_points[inside_leg_mask]
-            R_points = near_landing_points[inside_leg_mask]
-            R_normals = near_landing_normals[inside_leg_mask]
+            B_points = self.kin._R2B(R_points.T,leg_index).T
+            B_normals = self.kin.RVectorToLeg(R_normals.T,leg_index).T
 
-            if B_points.shape[0]==0:
-                selected_scores = np.full(
-                    candidate_top_k,missing_candidate_score,dtype=np.float64
-                )
-                outside_scores = _OutsideWorkspaceScores(
-                    all_B_points,inside_leg_mask,leg_index,select_num=3
-                )
-                selected_scores[:outside_scores.size] = outside_scores
-                leg_costs[leg_index] = float(np.mean(_Softplus(-selected_scores)**2))
+            # 可评分性仅依赖指定分支的查表结果，不调用在线 IK。
+            inside_leg_mask = leg_voxels.IsInsideRange(B_points)
+            B_points = B_points[inside_leg_mask]
+            B_normals = B_normals[inside_leg_mask]
+            flat_index = leg_voxels.Pos2FlatIndex(B_points)
+            x_b3 = leg_voxels.x_b3[flat_index,sol_index]
+            B_ankle_pos = leg_voxels.ankle_pos[flat_index,sol_index]
+            score_mask = (
+                self.robot_voxels.robot_reachable_legs[flat_index,sol_index,leg_index]
+                &np.isfinite(x_b3).all(axis=1)
+                &np.isfinite(B_ankle_pos).all(axis=1)
+            )
+            if not score_mask.any():
+                if worst_point_cost is None:
+                    # 两个工作空间分段取较大的上界；距离场插值不低于
+                    # 网格最小值及 outside_value 中的较小者。
+                    bounds = np.asarray(leg_voxels._bounds,dtype=np.float64)
+                    max_radius = np.linalg.norm(np.max(np.abs(bounds),axis=1))
+                    radius_max_cost = (
+                        max(0.0,max_radius-max_leg_radius)/workspace_distance_scale
+                    )**2
+                    min_boundary_distance = min(
+                        0.0,float(np.min(self.robot_voxels.to_bound_dist))
+                    )
+                    boundary_max_cost = (
+                        max(0.0,leg_boundary_margin-min_boundary_distance)
+                        /workspace_distance_scale
+                    )**2
+                    min_ankle_distance = min(
+                        -ankle_safe_margin,
+                        float(np.min(self.env_pointsmap_voxels.env_esdf)),
+                    )
+                    worst_point_cost = (
+                        max(radius_max_cost,boundary_max_cost)
+                        +((np.pi-xb3_angle_limit)/xb3_angle_limit)**2
+                        +plane_max_cost
+                        +(ankle_safe_margin-min_ankle_distance)**2
+                    )
+                leg_costs[leg_index] = best_point_count**2+worst_point_cost
                 continue
 
-            flat_index = leg_voxels.Pos2FlatIndex(B_points)
+            B_points = B_points[score_mask]
+            B_normals = B_normals[score_mask]
+            flat_index = flat_index[score_mask]
+            x_b3 = x_b3[score_mask]
+            B_ankle_pos = B_ankle_pos[score_mask]
 
-            # 分支无关项：工作空间有符号距离和足端最大半径。
-            workspace_distance = leg_voxels.TrilinearSample(
+            radius = np.linalg.norm(B_points,axis=1)
+            workspace_cost = (
+                np.maximum(0.0,radius-max_leg_radius)/workspace_distance_scale
+            )**2
+            boundary_distance = leg_voxels.TrilinearSample(
                 self.robot_voxels.to_bound_dist[...,leg_index],
-                B_points,
-                outside_value=-10.0*distance_score_scale,
+                B_points,outside_value=0.0,
             )
-            workspace_margin = workspace_distance-workspace_safe_margin
-            radial_margin = max_leg_radius-np.linalg.norm(B_points,axis=1)
-            workspace_feasible_count = int(np.sum(
-                (workspace_margin>=0.0)&(radial_margin>=0.0)
-            ))
-            common_score = _SmoothMin(
-                workspace_margin/distance_score_scale,
-                radial_margin/distance_score_scale,
+            boundary_cost = (
+                np.maximum(0.0,leg_boundary_margin-boundary_distance)/workspace_distance_scale
+            )**2
+
+            # inside_radius_mask = radius<=max_leg_radius
+            # if inside_radius_mask.any():
+            #     workspace_cost[inside_radius_mask] = (
+            #         np.maximum(0.0,leg_boundary_margin-boundary_distance[inside_radius_mask])
+            #         /workspace_distance_scale
+            #     )**2
+
+            normal_norm = np.linalg.norm(B_normals,axis=1)
+            normal_valid = np.isfinite(B_normals).all(axis=1)&(normal_norm>eps)
+            normalized_normals = np.zeros_like(B_normals,dtype=np.float64)
+            normalized_normals[normal_valid] = (
+                B_normals[normal_valid]/normal_norm[normal_valid,None]
             )
 
-            # 腿平面法向约束是公共项，x_b3 朝向是分支项。
-            pn = np.column_stack([
-                self.kin.leg_base_p[1,leg_index]-R_points[:,1],
-                R_points[:,0]-self.kin.leg_base_p[0,leg_index],
-                np.zeros(R_points.shape[0],dtype=R_points.dtype),
-            ])
-            pn /= np.maximum(np.linalg.norm(pn,axis=1,keepdims=True),1e-5)
-            normalized_normals = R_normals/np.maximum(
-                np.linalg.norm(R_normals,axis=1,keepdims=True),1e-5
+            xb3_norm = np.linalg.norm(x_b3,axis=1)
+            xb3_valid = normal_valid&(xb3_norm>eps)
+            xb3_angle = np.full(B_points.shape[0],np.pi,dtype=np.float64)
+            xb3_dot = np.einsum(
+                "ij,ij->i",x_b3[xb3_valid]/xb3_norm[xb3_valid,None],
+                -normalized_normals[xb3_valid],
             )
-            plane_margin = cos_plane_limit-np.abs(
-                np.sum(normalized_normals*pn,axis=1)
-            )
+            xb3_angle[xb3_valid] = np.arccos(np.clip(xb3_dot,-1.0,1.0))
+            xb3_cost = (np.maximum(0.0,xb3_angle-xb3_angle_limit)/xb3_angle_limit)**2
 
-            B_normals = normalized_normals.copy()
-            if leg_index<3:
-                B_normals[:,:2] *= -1
-            x_b3 = leg_voxels.x_b3[flat_index]
-            finite_x_b3 = np.isfinite(x_b3).all(axis=2)
-            branch_normal_margin = (
-                np.einsum(
-                    "njk,nk->nj",np.nan_to_num(x_b3,nan=0.0),-B_normals
-                )-cos_branch_limit
+            # 与 _LegNormFeasi 的 pn 等价：这是由 B 原点、B 点和 B-z
+            # 轴确定平面的法向量。符号不影响相对该平面的绝对夹角。
+            plane_normal = np.cross(
+                np.broadcast_to(z_axis,B_points.shape),B_points
             )
-            normal_score = _SmoothMin(
-                plane_margin[:,None]/normal_score_scale,
-                branch_normal_margin/normal_score_scale,
+            plane_normal_norm = np.linalg.norm(plane_normal,axis=1)
+            plane_valid = normal_valid&(plane_normal_norm>eps)
+            plane_angle = np.full(B_points.shape[0],np.pi/2.0,dtype=np.float64)
+            plane_dot = np.einsum(
+                "ij,ij->i",normalized_normals[plane_valid],
+                plane_normal[plane_valid]/plane_normal_norm[plane_valid,None],
             )
+            plane_angle[plane_valid] = np.abs(np.arcsin(np.clip(plane_dot,-1.0,1.0)))
+            plane_violation = np.maximum(
+                0.0,plane_angle-plane_angle_limit
+            )/plane_angle_limit
+            plane_cost = plane_violation**2
 
-            # ankle 与环境的碰撞距离依赖 IK 分支，足端本身允许接触环境。
-            ankle_B = leg_voxels.ankle_pos[flat_index]
-            finite_ankle = np.isfinite(ankle_B).all(axis=2)
-            ankle_R = self.kin._B2R(
-                np.nan_to_num(ankle_B,nan=0.0).reshape(-1,3).T,
-                leg_index,
-            ).T
-            ankle_W = (W_T_R*ankle_R.T).T
+            W_ankle_pos = (W_T_R*self.kin._B2R(B_ankle_pos.T,leg_index)).T
             ankle_distance = env_voxels.TrilinearSample(
-                self.env_pointsmap_voxels.env_esdf,
-                ankle_W,
-                outside_value=-distance_score_scale,
+                self.env_pointsmap_voxels.env_esdf,W_ankle_pos,
+                outside_value=-ankle_safe_margin,
             )
-            collision_score = (
-                ankle_distance.reshape(-1,2)-leg_voxels.ankle_collide_radi
-            )/distance_score_scale
+            ankle_cost = np.maximum(0.0,ankle_safe_margin-ankle_distance)**2
 
-            branch_valid = (
-                self.robot_voxels.robot_reachable_legs[flat_index,:,leg_index]
-                & finite_ankle
-                & finite_x_b3
+            # xb3 超过无惩罚阈值后，在 10° 内平滑过渡到最大 plane 代价。
+            xb3_excess = np.maximum(0.0,xb3_angle-xb3_angle_limit)
+            transition_t = np.clip(xb3_excess/xb3_transition,0.0,1.0)
+            smooth_step = transition_t**2*(3.0-2.0*transition_t)
+            plane_cost = (
+                (1.0-smooth_step)*plane_cost
+                +smooth_step*plane_max_cost
             )
-            branch_score = _SmoothMin(normal_score,collision_score)
-            score_per_branch = _SmoothMin(common_score[:,None],branch_score)
-            score_per_branch[~branch_valid] = missing_candidate_score
-
-            # 若当前体素没有有效分支，保留工作空间负分数作为优化方向。
-            has_valid_branch = branch_valid.any(axis=1)
-            candidate_scores = common_score.astype(np.float64,copy=True)
-            candidate_scores[has_valid_branch] = _SmoothMax(
-                score_per_branch[has_valid_branch],axis=1
+            # 边界距离与 ankle 都和硬检查使用相同的插值；半径沿用
+            # 体素中心判据，只统计指定分支。一个落脚点只计一次。
+            hard_feasible = (
+                (boundary_distance>=0.04)
+                &(np.linalg.norm(leg_voxels.center[flat_index],axis=1)<=0.3)
+                &(xb3_angle<=np.deg2rad(95.0))
+                &(plane_angle<=np.deg2rad(20.0))
+                &(ankle_distance>=leg_voxels.ankle_collide_radi)
             )
-            # bounds内但超过工作空间的点已经包含在candidate_scores中；若真正
-            # 的工作空间点仍少于3个，再从bounds外按扩展to_bound_dist补充。
-            outside_scores = _OutsideWorkspaceScores(
-                all_B_points,
-                inside_leg_mask,
-                leg_index,
-                select_num=max(0,3-workspace_feasible_count),
-            )
-            if outside_scores.size>0:
-                candidate_scores = np.concatenate([
-                    candidate_scores,outside_scores
-                ])
+            count_cost = max(best_point_count-np.count_nonzero(hard_feasible),0)**2
+            point_costs = workspace_cost+boundary_cost+xb3_cost+plane_cost+ankle_cost
+            selected_count = min(best_point_count,point_costs.size)
+            best_costs = np.partition(point_costs,selected_count-1)[:selected_count]
+            leg_costs[leg_index] = count_cost+float(np.mean(best_costs))
 
-            select_num = min(candidate_top_k,candidate_scores.size)
-            selected_scores = np.full(
-                candidate_top_k,missing_candidate_score,dtype=np.float64
-            )
-            if select_num>0:
-                top_scores = np.partition(
-                    candidate_scores,candidate_scores.size-select_num
-                )[-select_num:]
-                selected_scores[:select_num] = top_scores
-
-            # 分数越高代价越低；候选不足时由缺失分数补齐。
-            leg_costs[leg_index] = float(np.mean(_Softplus(-selected_scores)**2))
-
-        worst_leg_cost = float(_SmoothMax(leg_costs,axis=0))
-        leg_cost = 0.5*float(np.mean(leg_costs))+0.5*worst_leg_cost
-        return float(body_weight*body_cost+leg_weight*leg_cost)
+        return float(body_weight*body_cost+np.mean(leg_costs))
 
 
     def VisualizeRobotFeasiCheck(self,

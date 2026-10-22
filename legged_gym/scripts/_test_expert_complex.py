@@ -56,7 +56,7 @@ path_se3 = []
 # for i in range(100):
 #     path_se3.append(SE3(0.345,1.24,0.24+i*0.02))
 #从.json文件中读取
-path_file = Path(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path/initial_se3_path_20260928_174515.json")
+path_file = Path(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path/optimized_se3_path_20260929_113146.json")
 path_se3 = LoadFromBezierFile(path_file)
 # path_file = Path(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path/teleop_demo_20260927_194709.json")
 # path_se3 = LoadFromTeletopFile(path_file)
