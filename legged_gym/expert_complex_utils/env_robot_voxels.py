@@ -878,10 +878,10 @@ class RoboVoxels:
         flat_index = np.where(self.body_voxels.esdf_flat_for_env<=0)
         plotter.add_mesh(pv.PolyData(self.body_voxels.center[flat_index]),render_points_as_spheres=True,point_size=20,color='green',opacity=0.4)
 
-        plotter.add_mesh(pv.PolyData(self.body_voxels.bounding_points),
-                         render_points_as_spheres=True,
-                         point_size=20,
-                         color='blue',opacity=0.8)
+        # plotter.add_mesh(pv.PolyData(self.body_voxels.bounding_points),
+        #                  render_points_as_spheres=True,
+        #                  point_size=20,
+        #                  color='blue',opacity=0.8)
         #绘制身体STL
         # body_mesh_for_leg = self.body_voxels.body_mesh_for_leg
         # faces = np.column_stack([
