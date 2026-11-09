@@ -254,7 +254,10 @@ class RobotVoxelData:
 
     Cache files currently omit grid scales/robot bounds; from_files therefore
     exposes those parameters explicitly, defaulting to the existing robot.
-    Body ESDF is optional for soft scoring but required for native hard checks.
+    Body ESDF is optional; hard checks and scoring query the environment ESDF
+    at cached body surface samples. ankle_radius is legacy metadata only;
+    HexStateTorch.LEG_ANKLE_HARD_MARGIN controls the online ankle checks.
+    Mechanical margin (N) is required when constructing a scoring snapshot.
     """
     leg_grid: VoxelGridData
     env_grid: VoxelGridData
@@ -270,16 +273,17 @@ class RobotVoxelData:
     normals: np.ndarray
     landing_count: int
     env_esdf: np.ndarray
-    ankle_radius: float = 0.045
+    ankle_radius: float = 0.05
     body_grid: VoxelGridData | None = None
     body_esdf: np.ndarray | None = None
+    mechanical_margin: np.ndarray | None = None
 
     @classmethod
     def from_files(cls, point_map_file, voxel_dir=None, *, env_esdf_file=None,
-                   leg_bounds=((-0.14, 0.38), (-0.38, 0.38), (-0.27, 0.25)),
+                   leg_bounds=((-0.14, 0.38), (-0.38, 0.38), (-0.4, 0.4)),
                    body_bounds=((-0.4, 0.4), (-0.5, 0.5), (-0.2, 0.2)),
-                   leg_voxel_scale=0.01, body_voxel_scale=0.01, env_voxel_scale=0.04,
-                   leg_base_p=None, bx=0.1, by=0.22, ankle_radius=0.045,
+                   leg_voxel_scale=0.01, body_voxel_scale=0.01, env_voxel_scale=0.01,
+                   leg_base_p=None, bx=0.1, by=0.22, ankle_radius=0.05,
                    suction_to_foot_offset=0.03):
         """Read existing NPZ files only; never generate ESDF/IK or write caches."""
         if voxel_dir is None:
@@ -291,16 +295,16 @@ class RobotVoxelData:
                 missing = set(required)-set(file.files)
                 if missing:
                     raise ValueError(f"{path} is missing fields: {', '.join(sorted(missing))}")
-                return {key: np.array(file[key], copy=True)
+                return {key: file[key]
                         for key in (*required, *optional) if key in file.files}
 
         cloud = read(point_map_file, ("points", "normals", "landing_count"), ("bounds",))
-        leg = read(directory/"leg_voxels_info.npz", ("x_b3", "ankle_pos"))
+        leg = read(directory/"leg_voxels_info.npz", ("x_b3", "ankle_pos", "mechanical_margin"))
         body = read(directory/"body_voxels_info.npz", ("esdf_for_env", "bounding_points"))
         robot = read(directory/"robot_reachable_legs.npz", ("robot_reachable_legs", "to_bound_dist"))
         env = read(env_esdf_file or directory/"env_voxels.npz", ("esdf",))
-        points = cloud["points"].astype(np.float32)
-        normals = cloud["normals"].astype(np.float32)
+        points = cloud["points"].astype(np.float32, copy=False)
+        normals = cloud["normals"].astype(np.float32, copy=False)
         saved_count = np.asarray(cloud["landing_count"])
         if saved_count.size != 1 or not np.issubdtype(saved_count.dtype, np.integer):
             raise ValueError("landing_count must contain one integer")
@@ -318,11 +322,20 @@ class RobotVoxelData:
         if not math.isfinite(suction_to_foot_offset):
             raise ValueError("suction_to_foot_offset must be finite")
         leg_grid = VoxelGridData(leg_bounds, leg_voxel_scale)
+        expected_margin_shape = (int(np.prod(leg_grid.grid_shape)),)
+        if leg["mechanical_margin"].shape != expected_margin_shape:
+            raise ValueError(
+                f"mechanical_margin shape {leg['mechanical_margin'].shape} does not match "
+                f"expected {expected_margin_shape}; leg grid shape={tuple(leg_grid.grid_shape)}, "
+                f"bounds={leg_grid.bounds.tolist()}, voxel_scale={leg_grid.voxel_scale}. "
+                "Use the same bounds and scale as the NumPy cache builder."
+            )
         landing = points[:count]+normals[:count]*suction_to_foot_offset
         return cls(leg_grid, VoxelGridData(bounds, env_voxel_scale), leg_base_p, leg_grid.centers(),
                    leg["x_b3"], leg["ankle_pos"], robot["robot_reachable_legs"], robot["to_bound_dist"],
                    body["bounding_points"], points, landing, normals, count, env["esdf"], ankle_radius,
-                   VoxelGridData(body_bounds, body_voxel_scale), body["esdf_for_env"])
+                   VoxelGridData(body_bounds, body_voxel_scale), body["esdf_for_env"],
+                   mechanical_margin=leg["mechanical_margin"])
 
 
 class HexStateTorch:
@@ -333,6 +346,36 @@ class HexStateTorch:
     ``RobotFeasiCost`` also accepts PreparedCandidates to skip input validation
     and deduplication in the optimizer's hot path.
     """
+    # 与 HexState 保持同名同值。修改后重新创建对象，不在运行中同步缓存。
+    BODY_HARD_CLEARANCE = 0.00  # m
+    BODY_SOFT_CLEARANCE = 0.02  # m
+    BODY_COST_WEIGHT = 10.0
+
+    LEG_BOUNDARY_HARD_MARGIN = 0.03
+    LEG_BOUNDARY_SOFT_MARGIN = 0.06
+    LEG_BOUNDARY_COST_SCALE = 0.02
+
+    LEG_FORCE_HARD_MARGIN = 90.0  # N
+    LEG_FORCE_SOFT_MARGIN = 120.0
+    LEG_FORCE_COST_SCALE = 10.0
+
+    LEG_PLANE_HARD_ANGLE_DEG = 15.0
+    LEG_PLANE_SOFT_ANGLE_DEG = 10.0
+    LEG_PLANE_COST_SCALE = 4.0
+
+    LEG_XB3_HARD_ANGLE_DEG = 85.0
+    LEG_XB3_SOFT_ANGLE_DEG = 70.0
+    LEG_XB3_COST_SCALE = 10.0
+    LEG_XB3_TRANSITION_DEG = 10.0
+
+    LEG_ANKLE_HARD_MARGIN = 0.05
+    LEG_ANKLE_SOFT_MARGIN = 0.08
+    LEG_ANKLE_COST_SCALE = 0.03
+
+    LEG_END_HARD_CLEARANCE = 0.03
+    LEG_LEG_END_HARD_CLEARANCE = 0.05
+    COST_TARGET_FOOTHOLDS = 6
+
     def __init__(self, map_data, device="auto", dtype=torch.float32, pose_chunk_size=64):
         self.device = resolve_device(device)
         if dtype not in (torch.float32, torch.float64):
@@ -370,11 +413,15 @@ class HexStateTorch:
                 raise ValueError(f"{name} shape {array.shape} does not match {shape}")
             if finite and not np.isfinite(array).all():
                 raise ValueError(f"{name} contains non-finite values")
-            return torch.tensor(array.copy(), device=self.device, dtype=dtype or self.dtype)
+            # torch.tensor owns its storage; no intermediate full-array copy.
+            return torch.tensor(array, device=self.device, dtype=dtype or self.dtype)
 
         if self.landing_count < 0 or self.landing_count > len(data.points):
             raise ValueError("invalid landing_count")
         g = self.leg_voxels.grid_size
+        if data.mechanical_margin is None:
+            raise ValueError("mechanical_margin is required for force-based scoring")
+        self.mechanical_margin = snapshot("mechanical_margin", data.mechanical_margin, (g,), finite=False)
         self.env_esdf = snapshot("env_esdf", data.env_esdf, self.env_voxels.grid_shape)
         self.to_bound_dist = snapshot("to_bound_dist", data.to_bound_dist, self.leg_voxels.grid_shape+(6,))
         self.x_b3 = snapshot("x_b3", data.x_b3, (g, 2, 3), finite=False)
@@ -385,11 +432,12 @@ class HexStateTorch:
         self.landing_points = snapshot("landing_points", data.landing_points, (self.landing_count, 3))
         self.normals = snapshot("normals", data.normals[:self.landing_count],
                                 (self.landing_count, 3), finite=False)
-        bounding = np.asarray(data.bounding_points).reshape(-1, 3)
+        bounding = np.asarray(data.bounding_points)
+        if bounding.ndim != 2 or bounding.shape[1] != 3 or len(bounding) == 0:
+            raise ValueError("bounding_points must be a nonempty finite (N,3) array")
         self.bounding_points = snapshot("bounding_points", bounding, bounding.shape)
-        self.ankle_radius = float(data.ankle_radius)
-        if not math.isfinite(self.ankle_radius) or self.ankle_radius < 0:
-            raise ValueError("invalid ankle_collide_radi")
+        if not math.isfinite(float(data.ankle_radius)) or data.ankle_radius < 0:
+            raise ValueError("invalid legacy ankle_radius metadata")
         self._points_cpu = np.array(data.points, dtype=np.float64, copy=True)
         if self._points_cpu.ndim != 2 or self._points_cpu.shape[1] != 3 or not np.isfinite(self._points_cpu).all():
             raise ValueError("points must be finite (N,3)")
@@ -402,14 +450,32 @@ class HexStateTorch:
         if data.body_grid is not None and data.body_esdf is not None:
             self.body_voxels = VoxelsTorch(data.body_grid, self.device, self.dtype)
             self.body_esdf = snapshot("body_esdf", data.body_esdf, self.body_voxels.grid_shape)
-        bounds = np.asarray(data.leg_grid.bounds, dtype=np.float64)
-        max_radius = np.linalg.norm(np.max(np.abs(bounds), axis=1))
-        radius_max = (max(0., max_radius-0.28)/0.03)**2
+        force_max = (self.LEG_FORCE_SOFT_MARGIN/self.LEG_FORCE_COST_SCALE)**2
         min_boundary = min(0., float(np.min(data.to_bound_dist)))
-        boundary_max = (max(0., 0.05-min_boundary)/0.03)**2
-        min_ankle = min(-0.06, float(np.min(data.env_esdf)))
-        self.empty_leg_cost = 36+max(radius_max, boundary_max)+(100/80)**2+25+(0.06-min_ankle)**2
+        boundary_max = (max(0., self.LEG_BOUNDARY_SOFT_MARGIN-min_boundary)/self.LEG_BOUNDARY_COST_SCALE)**2
+        min_ankle = min(-self.LEG_ANKLE_SOFT_MARGIN, float(np.min(data.env_esdf)))
+        self.empty_leg_cost = (
+            self.COST_TARGET_FOOTHOLDS**2+force_max+boundary_max
+            +((math.pi-math.radians(self.LEG_XB3_SOFT_ANGLE_DEG))/math.radians(self.LEG_XB3_COST_SCALE))**2
+            +((math.pi/2-math.radians(self.LEG_PLANE_SOFT_ANGLE_DEG))/math.radians(self.LEG_PLANE_COST_SCALE))**2
+            +((self.LEG_ANKLE_SOFT_MARGIN-min_ankle)/self.LEG_ANKLE_COST_SCALE)**2
+        )
         self.leg_ids = torch.arange(6, device=self.device)[None, :, None]
+
+    def _BodyEnvironmentDistances(self, poses):
+        """Device (...,4,4) poses -> (...,N,3) surface points and (...,N) distances.
+
+        All cached points are queried independently of landing candidates. Only
+        query-sized intermediates are created; invalid/map-outside points get -inf.
+        """
+        world = self.bounding_points @ poses[..., :3, :3].transpose(-1, -2)+poses[..., None, :3, 3]
+        valid = torch.isfinite(world).all(-1) & self.env_voxels.IsInsideRange(world)
+        safe = torch.where(valid[..., None], world, self.env_voxels._bounds[:, 0])
+        distances = self.env_voxels.TrilinearSample(
+            self.env_esdf, safe, -self.BODY_SOFT_CLEARANCE,
+        )
+        distances = torch.where(valid & torch.isfinite(distances), distances, -float("inf"))
+        return world, distances
 
     def GetRobotFeasiCostPointsBatch(self, W_T_R, workers=-1):
         """CPU setup-only search; returns ragged rows, matching legacy queries."""
@@ -417,7 +483,7 @@ class HexStateTorch:
         if matrices.ndim != 3 or matrices.shape[1:] != (4, 4) or not np.isfinite(matrices).all():
             raise ValueError("W_T_R must be finite (B,4,4) CPU matrices")
         batch = len(matrices)
-        k = min(2400, len(self._points_cpu))
+        k = min(4800, len(self._points_cpu))
         if k == 0 or batch == 0:
             return [np.zeros(0, dtype=np.int64) for _ in range(batch)]
         _, idx = self._tree.query(matrices[:, :3, 3], k=k, workers=workers)
@@ -437,20 +503,18 @@ class HexStateTorch:
     def RobotFeasiCheck(self, W_T_R, points_idx=None):
         """Native hard check, returning CPU indices and masks for the planner.
 
-        Both IK branches are tested. Body clearance uses environment points in
-        the robot body ESDF (5 mm), workspace uses 4 cm/30 cm limits, normals use
-        the 70-degree plane cone and 95-degree xb3 rule, and ankle uses env ESDF.
-        End-point collision remains excluded, matching the planner's hard rules.
+        Both IK branches are tested with the same thresholds as HexState.
+        The third result is one mask per cached body surface sample, independent
+        of points_idx. Workspace uses force and boundary distance, without a
+        leg-base radius condition. End-point collision remains excluded.
         """
-        if self.body_voxels is None or self.body_esdf is None:
-            raise RuntimeError("RobotFeasiCheck requires body_grid and body_esdf in RobotVoxelData")
         matrix = W_T_R.A if hasattr(W_T_R, "A") else W_T_R
         pose = torch.as_tensor(matrix, device=self.device, dtype=self.dtype)
         if pose.shape != (4, 4) or not bool(torch.isfinite(pose).all()):
             raise ValueError("W_T_R must be a finite (4,4) pose")
         rotation, translation = pose[:3, :3], pose[:3, 3]
         if points_idx is None:
-            k = min(2400, len(self._points_cpu))
+            k = min(4800, len(self._points_cpu))
             if k:
                 _, idx = self._tree.query(translation.cpu().numpy(), k=k)
                 idx = np.asarray(idx, dtype=np.int64).reshape(-1)
@@ -462,11 +526,8 @@ class HexStateTorch:
                 raise ValueError("points_idx must be a one-dimensional integer array")
             if np.any(idx < 0) or np.any(idx >= len(self._points_cpu)):
                 raise IndexError("points_idx out of range")
-        tensor_idx = torch.as_tensor(idx, device=self.device, dtype=torch.long)
-        robot_env_points = (self.points[tensor_idx]-translation) @ rotation
-        inside_body = self.body_voxels.IsInsideRange(robot_env_points)
-        body_distance = self.body_voxels.TrilinearSample(self.body_esdf, robot_env_points, 0.05)
-        body_free = ~inside_body | (body_distance >= 0.005)
+        _, body_distance = self._BodyEnvironmentDistances(pose)
+        body_free = body_distance >= self.BODY_HARD_CLEARANCE
         landing_idx = idx[idx < self.landing_count]
         if points_idx is None and len(landing_idx) <= 60 and self.landing_count:
             _, landing_idx = self._landing_tree.query(translation.cpu().numpy(), k=min(100, self.landing_count))
@@ -474,26 +535,28 @@ class HexStateTorch:
         landing_tensor = torch.as_tensor(landing_idx, device=self.device, dtype=torch.long)
         robot_points = (self.landing_points[landing_tensor]-translation) @ rotation
         robot_normals = self.normals[landing_tensor] @ rotation
-        leg_ids = torch.arange(6, device=self.device)[:, None]
+        leg_ids = self.leg_ids[0]
         leg_points = self.kin._R2B(robot_points[None], leg_ids)
         leg_normals = self.kin.RVectorToLeg(robot_normals[None], leg_ids)
         flat = self.leg_voxels.Pos2FlatIndex(leg_points)
-        boundary = self.leg_voxels.TrilinearSample(self.to_bound_dist, leg_points, 0., leg_ids)
-        workspace = (self.leg_voxels.IsInsideRange(leg_points) & (boundary >= 0.04)
-                     & (torch.linalg.vector_norm(self.centers[flat], dim=-1) <= 0.3))
+        workspace = (self.leg_voxels.IsInsideRange(leg_points)
+                     & (self.mechanical_margin[flat] >= self.LEG_FORCE_HARD_MARGIN)
+                     & (self.leg_voxels.TrilinearSample(
+                         self.to_bound_dist, leg_points, -0.01, leg_ids
+                     ) >= self.LEG_BOUNDARY_HARD_MARGIN))
         # Preserve hard-check normalization, including degenerate/zero vectors.
         normalized = leg_normals/torch.linalg.vector_norm(leg_normals, dim=-1, keepdim=True).clamp_min(1e-5)
-        plane = torch.stack((-leg_points[..., 1], leg_points[..., 0], torch.zeros_like(boundary)), -1)
+        plane = torch.stack((-leg_points[..., 1], leg_points[..., 0], torch.zeros_like(leg_points[..., 0])), -1)
         plane = plane/torch.linalg.vector_norm(plane, dim=-1, keepdim=True).clamp_min(1e-5)
-        plane_ok = (normalized*plane).sum(-1).abs() <= math.cos(math.radians(70))
+        plane_ok = (normalized*plane).sum(-1).abs() <= math.cos(math.radians(90-self.LEG_PLANE_HARD_ANGLE_DEG))
         xb3 = self.x_b3[flat]
-        xb3_ok = (xb3 * -normalized[:, :, None]).sum(-1) >= math.cos(math.radians(95))
+        xb3_ok = (xb3 * -normalized[:, :, None]).sum(-1) >= math.cos(math.radians(self.LEG_XB3_HARD_ANGLE_DEG))
         ankle = torch.nan_to_num(self.ankle_pos[flat], nan=0.)
         robot_ankle = self.kin._B2R(ankle, leg_ids[:, :, None])
         world_ankle = robot_ankle @ rotation.T+translation
-        ankle_distance = self.env_voxels.TrilinearSample(self.env_esdf, world_ankle, -0.06)
+        ankle_distance = self.env_voxels.TrilinearSample(self.env_esdf, world_ankle, -self.LEG_ANKLE_HARD_MARGIN)
         feasible = (workspace[:, :, None] & plane_ok[:, :, None] & xb3_ok
-                    & self.reachable[flat, :, leg_ids] & (ankle_distance >= self.ankle_radius))
+                    & self.reachable[flat, :, leg_ids] & (ankle_distance >= self.LEG_ANKLE_HARD_MARGIN))
         return idx, landing_idx, body_free.cpu().numpy(), feasible.cpu().numpy()
 
     def prepare_candidates(self, rows, sol_index=1):
@@ -539,6 +602,8 @@ class HexStateTorch:
 
         ``return_details`` is useful when comparing mixed/double precision near
         hard thresholds. The CMA hot path requests only costs.
+        All penalties and hard counts use the class BODY_/LEG_ constants.
+        NaN/-inf margins mean 0 N; +inf has zero force penalty.
         """
         poses = torch.as_tensor(W_T_R, device=self.device, dtype=self.dtype)
         if poses.ndim != 3 or poses.shape[1:] != (4, 4):
@@ -565,13 +630,10 @@ class HexStateTorch:
         poses = torch.where(finite_pose[:, None, None], poses,
                             torch.eye(4, device=self.device, dtype=self.dtype))
         rotation, translation = poses[:, :3, :3], poses[:, :3, 3]
-        body_cost = poses.new_zeros(len(poses))
-        if len(self.bounding_points):
-            world_body = self.bounding_points[None] @ rotation.transpose(-1, -2)+translation[:, None]
-            distance = self.env_voxels.TrilinearSample(self.env_esdf, world_body, -0.08)
-            body_cost = ((0.08-distance).clamp_min(0)/0.08).square().mean(-1)
+        _, distance = self._BodyEnvironmentDistances(poses)
+        body_cost = ((self.BODY_SOFT_CLEARANCE-distance).clamp_min(0)/self.BODY_SOFT_CLEARANCE).square().mean(-1)
         if not self.landing_count or not candidates.indices.shape[1]:
-            cost = 10*body_cost+self.empty_leg_cost
+            cost = self.BODY_COST_WEIGHT*body_cost+self.empty_leg_cost
             cost = torch.where(finite_pose, cost, float("inf"))
             zero = torch.zeros((len(poses), 6), device=self.device, dtype=torch.long)
             return (cost, {"hard_feasible_count": zero, "scorable_count": zero}) if return_details else cost
@@ -588,10 +650,11 @@ class HexStateTorch:
                       & self.reachable[flat, branches, self.leg_ids]
                       & torch.isfinite(xb3).all(-1) & torch.isfinite(ankle).all(-1))
         xb3, ankle = torch.nan_to_num(xb3), torch.nan_to_num(ankle)
-        radius = torch.linalg.vector_norm(leg_points, dim=-1)
-        workspace_cost = ((radius-0.28).clamp_min(0)/0.03).square()
+        mechanical_margin = torch.nan_to_num(
+            self.mechanical_margin[flat], nan=0., posinf=float("inf"), neginf=0.)
+        force_cost = ((self.LEG_FORCE_SOFT_MARGIN-mechanical_margin).clamp_min(0)/self.LEG_FORCE_COST_SCALE).square()
         boundary = self.leg_voxels.TrilinearSample(self.to_bound_dist, leg_points, 0., self.leg_ids)
-        boundary_cost = ((0.05-boundary).clamp_min(0)/0.03).square()
+        boundary_cost = ((self.LEG_BOUNDARY_SOFT_MARGIN-boundary).clamp_min(0)/self.LEG_BOUNDARY_COST_SCALE).square()
         eps = 1e-8
         normal_norm = torch.linalg.vector_norm(leg_normals, dim=-1)
         normal_valid = torch.isfinite(leg_normals).all(-1) & (normal_norm > eps)
@@ -600,33 +663,38 @@ class HexStateTorch:
         xb3_norm = torch.linalg.vector_norm(xb3, dim=-1)
         dot = ((xb3/xb3_norm.clamp_min(eps)[..., None]) * -normalized).sum(-1)
         xb3_angle = torch.where(normal_valid & (xb3_norm > eps), dot.clamp(-1, 1).acos(), math.pi)
-        xb3_limit = math.radians(80)
-        xb3_cost = ((xb3_angle-xb3_limit).clamp_min(0)/xb3_limit).square()
+        xb3_cost = ((xb3_angle-math.radians(self.LEG_XB3_SOFT_ANGLE_DEG)).clamp_min(0)
+                    /math.radians(self.LEG_XB3_COST_SCALE)).square()
         # cross(z_axis, point) = [-y, x, 0].
-        plane = torch.stack((-leg_points[..., 1], leg_points[..., 0], torch.zeros_like(radius)), -1)
+        plane = torch.stack((-leg_points[..., 1], leg_points[..., 0], torch.zeros_like(boundary)), -1)
         plane_norm = torch.linalg.vector_norm(plane, dim=-1)
         plane_dot = (normalized*(plane/plane_norm.clamp_min(eps)[..., None])).sum(-1)
         plane_angle = torch.where(normal_valid & (plane_norm > eps), plane_dot.clamp(-1, 1).asin().abs(), math.pi/2)
-        plane_cost = ((plane_angle-math.radians(15)).clamp_min(0)/math.radians(15)).square()
+        plane_cost = ((plane_angle-math.radians(self.LEG_PLANE_SOFT_ANGLE_DEG)).clamp_min(0)
+                      /math.radians(self.LEG_PLANE_COST_SCALE)).square()
         robot_ankle = self.kin._B2R(ankle, self.leg_ids)
         world_ankle = torch.einsum("blni,bji->blnj", robot_ankle, rotation)+translation[:, None, None]
-        ankle_distance = self.env_voxels.TrilinearSample(self.env_esdf, world_ankle, -0.06)
-        ankle_cost = (0.06-ankle_distance).clamp_min(0).square()
-        transition = ((xb3_angle-xb3_limit)/math.radians(10)).clamp(0, 1)
+        ankle_distance = self.env_voxels.TrilinearSample(self.env_esdf, world_ankle, -self.LEG_ANKLE_SOFT_MARGIN)
+        ankle_cost = ((self.LEG_ANKLE_SOFT_MARGIN-ankle_distance).clamp_min(0)/self.LEG_ANKLE_COST_SCALE).square()
+        transition = ((xb3_angle-math.radians(self.LEG_XB3_SOFT_ANGLE_DEG))
+                      /math.radians(self.LEG_XB3_TRANSITION_DEG)).clamp(0, 1)
         smooth = transition.square()*(3-2*transition)
-        plane_cost = (1-smooth)*plane_cost+smooth*25
-        hard = (score_mask & (boundary >= 0.04)
-                & (torch.linalg.vector_norm(self.centers[flat], dim=-1) <= 0.3)
-                & (xb3_angle <= math.radians(95)) & (plane_angle <= math.radians(20))
-                & (ankle_distance >= self.ankle_radius))
-        count_cost = (6-hard.sum(-1)).clamp_min(0).to(self.dtype).square()
-        point_cost = workspace_cost+boundary_cost+xb3_cost+plane_cost+ankle_cost
+        plane_cost = (1-smooth)*plane_cost+smooth*(
+            (math.pi/2-math.radians(self.LEG_PLANE_SOFT_ANGLE_DEG))/math.radians(self.LEG_PLANE_COST_SCALE)
+        )**2
+        hard = (score_mask & (boundary >= self.LEG_BOUNDARY_HARD_MARGIN)
+                & (mechanical_margin >= self.LEG_FORCE_HARD_MARGIN)
+                & (xb3_angle <= math.radians(self.LEG_XB3_HARD_ANGLE_DEG))
+                & (plane_angle <= math.radians(self.LEG_PLANE_HARD_ANGLE_DEG))
+                & (ankle_distance >= self.LEG_ANKLE_HARD_MARGIN))
+        count_cost = (self.COST_TARGET_FOOTHOLDS-hard.sum(-1)).clamp_min(0).to(self.dtype).square()
+        point_cost = force_cost+boundary_cost+xb3_cost+plane_cost+ankle_cost
         point_cost = torch.where(score_mask, point_cost, float("inf"))
-        best = point_cost.topk(min(6, point_cost.shape[-1]), dim=-1, largest=False).values
+        best = point_cost.topk(min(self.COST_TARGET_FOOTHOLDS, point_cost.shape[-1]), dim=-1, largest=False).values
         best_valid = torch.isfinite(best)
         mean_best = torch.where(best_valid, best, 0.).sum(-1)/best_valid.sum(-1).clamp_min(1)
         leg_cost = torch.where(score_mask.any(-1), count_cost+mean_best, self.empty_leg_cost)
-        cost = 10*body_cost+leg_cost.mean(-1)
+        cost = self.BODY_COST_WEIGHT*body_cost+leg_cost.mean(-1)
         cost = torch.where(finite_pose, cost, float("inf"))
         if return_details:
             return cost, {"hard_feasible_count": hard.sum(-1)*finite_pose[:, None],

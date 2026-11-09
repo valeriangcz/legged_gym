@@ -1311,6 +1311,7 @@ class ExpertComplex:
         B_stance_points = np.column_stack([self.B_e_traj[leg_index][:,-1] for leg_index in stance_index])
         target_R_stance_points = self.kin._B2R(B_stance_points,stance_index).T #N,3
 
+        #从当前向未来反推
         for i in range(len(future_path_se3)-1,-1,-20):
             #未来位姿只用于筛选可行落脚点
             _,future_lp_idx,_,future_lp_mask = self.hex_state.RobotFeasiCheck(future_path_se3[i],lp_idx)
@@ -1334,9 +1335,33 @@ class ExpertComplex:
             elif i < 20:
                 print(">>>>>>> In Swing Traj Cal, there are less than three possible landing points in future pose")
                 print(f"future pose={future_path_se3[i]}\n landing points\n{self.hex_state.env_pointsmap_voxels.landing_points[future_lp_idx]}")
+        #从当前向未来推进
+        # for i in range(0,len(future_path_se3),20):
+        #     last_lp_mask = lp_mask.copy()
+        #     _,future_lp_idx,_,future_lp_mask = self.hex_state.RobotFeasiCheck(future_path_se3[i],lp_idx)
+        #     lp_mask = future_lp_mask&lp_mask
+        #     swing_has_lps_mask = lp_mask.any(axis=-1)
+        #     if not (np.sum(swing_has_lps_mask[swing_index],axis=1)>=3).all():
+        #         pointmap = self.hex_state.env_pointsmap_voxels
+        #         swing_has_lps_mask = last_lp_mask.any(axis=-1)
+        #         for leg_index in swing_index:
+        #             possible_points = (target_se3.inv() * (pointmap.landing_points[future_lp_idx[swing_has_lps_mask[leg_index]]].T)).T
+        #             mask = self.hex_state._LegLegCollisionFree(
+        #                 possible_points,target_R_stance_points,self.q3_branches[stance_index],leg_index,stance_index
+        #             )
+        #             future_lp_mask[leg_index,swing_has_lps_mask[leg_index]] &= mask
+        #         print(">>>>>>>>>in swing traj cal three are less than three possible points in future pos,last pose has",np.sum(swing_has_lps_mask[swing_index],axis=-1))
+        #         break
+        #     elif i > (len(future_path_se3)-21):
 
+
+
+            
         for leg_index in swing_index:
+            #配合从未来向现在推进
             same_branches_mask = future_lp_mask[leg_index,:,self.q3_branches[leg_index]]
+            #配合从现在向未来推进
+            # same_branches_mask = last_lp_mask[leg_index,:,self.q3_branches[leg_index]]
             if same_branches_mask.any():
                 chosen_lp_idx = future_lp_idx[same_branches_mask]
                 landing_q3_branch = int(self.q3_branches[leg_index])

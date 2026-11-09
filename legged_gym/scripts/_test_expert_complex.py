@@ -56,9 +56,9 @@ path_se3 = []
 # for i in range(100):
 #     path_se3.append(SE3(0.345,1.24,0.24+i*0.02))
 #从.json文件中读取
-path_file = Path(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path/optimized_se3_path_20260929_113146.json")
+path_file = Path(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path/initial_se3_path_20261028_172309.json")
 path_se3 = LoadFromBezierFile(path_file)
-# path_file = Path(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path/teleop_demo_20260927_194709.json")
+# path_file = Path(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path/teleop_demo_20261028_164819.json")
 # path_se3 = LoadFromTeletopFile(path_file)
 #初始化攀爬专家
 expert_complex = ExpertComplex()
@@ -70,7 +70,7 @@ q_init,tau_ff,adhesions = expert_complex.SetInitBySE3()
 env_cfg = HexClimbCfg()
 # env_cfg.terrain.mesh_type='plane'
 # env_cfg.terrain.stl_files = os.path.join(LEGGED_GYM_ROOT_DIR,"resources/environments/sutructure1/complex_surface.STL")
-env_cfg.terrain.stl_files = os.path.join(LEGGED_GYM_ROOT_DIR,"resources/environments/structure2/complex_surface3.STL")
+env_cfg.terrain.stl_files = os.path.join(LEGGED_GYM_ROOT_DIR,"resources/environments/structure2/complex_surface4.STL")
 env_cfg.env.num_envs = 1
 env_cfg.domain_rand.randomize_friction = False
 env_cfg.domain_rand.push_robots = False

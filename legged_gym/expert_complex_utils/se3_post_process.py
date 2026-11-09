@@ -87,13 +87,30 @@ class PostProcess:
         self.se3_path.clear()
         for t,ang,vec in zip(t_array,ang_array,vec_array):
             self.se3_path.append(SE3.Trans(t)*SE3.AngVec(ang,vec))
+        if "protected_pose_indices" not in raw_data:
+            raise ValueError("path JSON requires protected_pose_indices; use [] if no poses are protected")
+        protected = raw_data["protected_pose_indices"]
+        if not isinstance(protected, list) or any(
+            isinstance(index, bool) or not isinstance(index, int)
+            or index < 0 or index >= len(self.se3_path)
+            for index in protected
+        ):
+            raise ValueError(
+                "protected_pose_indices must be a list of 0-based integer indices "
+                f"in [0, {len(self.se3_path)})"
+            )
+        self.protected_pose_indices = sorted(set(protected))
         print(f"----->Finish Loading SE3 path\n length={t_array.shape[0]}\n source= {json_file}<-------")    
 
     def ShortCutPath(self):
         """
-        把前端输入的轨迹进行裁剪，减少路标点数量，尽可能使用直线连接起点终点
+        把前端输入的轨迹进行裁剪，减少路标点数量，尽可能使用 SE(3) 测地线连接
         从起点开始，找到距离最远的可行点，然后删除中间的点，然后沿着下一个点继续寻找
+        protected_pose_indices 中的原始位姿为分界点，任何连线都不能越过它们。
         """
+        if len(self.se3_path) < 2:
+            raise ValueError("path shortening requires at least two poses")
+        protected = self.protected_pose_indices
         start_index = 0
         short_path_index = [0]
         self.se3_path_short=[self.se3_path[0]]
@@ -101,16 +118,19 @@ class PostProcess:
             T1 = self.se3_path[start_index]
             #只要有任意一点能连接，就认为成功，要是计算到相邻点发现也无法连接，那就需要报错
             connectin_feasi = False
-            for end_index in range(len(self.se3_path)-1,start_index,-1):
+            next_boundary = next(
+                (index for index in protected if index > start_index), len(self.se3_path)-1
+            )
+            for end_index in range(next_boundary,start_index,-1):
                 print(f"checking path between index {start_index} and {end_index}")
                 T2 = self.se3_path[end_index]
                 self._CheckSamplingConfig()
                 dense_u = np.linspace(0.0,1.0,self.opt_cfg.presample_count)
-                dense_poses = [T1.interp(T2,float(u)) for u in dense_u]
+                dense_poses = [self.Geodesic(T1,T2,float(u)) for u in dense_u]
                 u_samples = self._DistanceSampleTimes(dense_u,dense_poses,[0.0,1.0])
                 interp_feasi = True
                 for u in u_samples:
-                    T = T1.interp(T2,float(u))
+                    T = self.Geodesic(T1,T2,float(u))
                     _,_,body_cf_mask,leg_mask = self.hex_state.RobotFeasiCheck(T)
                     landing_counts = leg_mask.any(axis=-1).sum(axis=-1)
                     if body_cf_mask.all() and ((landing_counts>=3).all()):
@@ -127,11 +147,95 @@ class PostProcess:
                     break
             if not connectin_feasi:
                 print(f"start_index={start_index}, end_index={end_index}\n T1:\n{T1.A}\n, T2:\n{T2.A}")
-                raise RuntimeError("adjecent transform cannot connect to each other")
+                raise RuntimeError(
+                    f"Adjacent transforms {start_index}->{start_index+1} cannot connect; "
+                    f"next protected/end boundary={next_boundary}"
+                )
+        self.short_path_indices = short_path_index
         print("Shorten path have key points num=",len(short_path_index))
         print(short_path_index)
 
     def GetCtrlPoes(self):
+        """构建连续曲线，缩柄/恢复原始路标修复空间可行性，再统一延时。"""
+        if len(self.se3_path_short)<2:
+            raise ValueError("SE3 Bezier optimization requires at least two way poses")
+        # Support callers selecting original waypoints without calling ShortCutPath.
+        indices = getattr(self,"short_path_indices",[])
+        if (len(indices)!=len(self.se3_path_short) or any(
+            not np.allclose(self.se3_path[index].A,pose.A,rtol=0,atol=1e-12)
+            for index,pose in zip(indices,self.se3_path_short)
+        )):
+            indices = []
+            start = 0
+            for pose in self.se3_path_short:
+                match = next((i for i in range(start,len(self.se3_path))
+                              if np.allclose(self.se3_path[i].A,pose.A,rtol=0,atol=1e-12)),None)
+                if match is None:
+                    raise ValueError("Shortened waypoints must map to ordered original poses for repair")
+                indices.append(match)
+                start = match+1
+        if (indices[0]!=0 or indices[-1]!=len(self.se3_path)-1
+            or any(b<=a for a,b in zip(indices[:-1],indices[1:]))
+            or not set(self.protected_pose_indices).issubset(indices)):
+            raise ValueError("Shortened path must retain endpoints and all protected poses in order")
+        self.short_path_indices = list(indices)
+        self.handle_scales = {index:1.0 for index in indices}
+        levels = (1.0,0.6,0.2,0.0)
+        self._BuildControlPoses()
+        retiming_count = 0
+        while True:
+            # Every change gets a fresh distance grid and a check from the start.
+            valid,diagnostics = self._ValidateTrajectory(
+                self.se3_ctrl_poses,stop_at_first=True
+            )
+            failure = diagnostics["first_invalid_sample"]
+            if failure is not None:
+                segment = failure["segment_index"]
+                left,right = self.short_path_indices[segment:segment+2]
+                print(f"Bezier repair: failure={failure}",flush=True)
+                if self.handle_scales[left]>0 or self.handle_scales[right]>0:
+                    for index in (left,right):
+                        level = levels.index(self.handle_scales[index])
+                        self.handle_scales[index] = levels[min(level+1,len(levels)-1)]
+                    print(f"Bezier repair: interval={left}->{right}, handle scales="
+                          f"{self.handle_scales[left]}, {self.handle_scales[right]}",flush=True)
+                elif right>left+1:
+                    middle = (left+right)//2
+                    self.short_path_indices.insert(segment+1,middle)
+                    self.se3_path_short.insert(segment+1,self.se3_path[middle])
+                    for index in (left,middle,right):
+                        self.handle_scales[index] = 1.0
+                    print(f"Bezier repair: restored original index={middle} in {left}->{right}; "
+                          f"waypoints={len(self.short_path_indices)}",flush=True)
+                else:
+                    raise RuntimeError(
+                        f"Bezier repair failed with zero handles on original adjacent poses "
+                        f"{left}->{right}: {failure}"
+                    )
+                self._BuildControlPoses()
+                retiming_count = 0
+                continue
+            if valid:
+                self.initial_repair_diagnostics = diagnostics
+                print(f"Bezier repair complete: waypoints={len(self.se3_path_short)}, "
+                      f"samples={diagnostics['sample_count']}",flush=True)
+                return
+            # Uniform timing preserves the curve and every continuity time ratio.
+            speed_factor = 1.0+self.opt_cfg.speed_limit_tolerance
+            if not np.isfinite(speed_factor) or speed_factor<=0:
+                raise ValueError("speed_limit_tolerance must be finite and greater than -1")
+            ratio = max(
+                diagnostics["max_linear_speed"]/(speed_factor*self.opt_cfg.v_max),
+                diagnostics["max_angular_speed"]/(speed_factor*self.opt_cfg.omega_max),
+            )
+            if not np.isfinite(ratio) or retiming_count>=3:
+                raise RuntimeError(f"Bezier retiming failed: {diagnostics}")
+            multiplier = max(1.0,ratio)*1.01
+            self.se3_segment_times = [duration*multiplier for duration in self.se3_segment_times]
+            retiming_count += 1
+            print(f"Bezier repair: uniformly extended segment times by {multiplier:.9g}",flush=True)
+
+    def _BuildControlPoses(self):
         """
         根据ShortCutPath得到的结果计算分段贝塞尔曲线的控制点
         同时根据优化配置参数决定可以优化位姿在self.ctrl_poses中的索引
@@ -148,9 +252,23 @@ class PostProcess:
             T2 = self.se3_path_short[i+1]
             self.se3_ctrl_poses.extend([T1,self.Geodesic(T1,T2,1/3),self.Geodesic(T1,T2,2/3),T2])
             times1 = np.linalg.norm(T1.t-T2.t)/(self.opt_cfg.v_max*0.3)
-            times2 = T1.angdist(T2)/(self.opt_cfg.omega_max*0.3)
+            times2 = np.linalg.norm(
+                trlog(T1.R@T2.R.T,twist=True,check=False)
+            )/(self.opt_cfg.omega_max*0.3)
             self.se3_segment_times.append(max(times1,times2,1e-6))
         self.se3_segment_nums = len(self.se3_path_short)-1
+        # Scale from this topology's baseline, never cumulatively. Each interior
+        # knot owns the preceding C2; UpdateCtrlPoses derives the matching next C1.
+        self.se3_ctrl_poses[1] = self.Geodesic(
+            self.se3_ctrl_poses[0],self.se3_ctrl_poses[1],
+            self.handle_scales[self.short_path_indices[0]],
+        )
+        for segment in range(self.se3_segment_nums):
+            end = 4*segment+3
+            self.se3_ctrl_poses[end-1] = self.Geodesic(
+                self.se3_ctrl_poses[end],self.se3_ctrl_poses[end-1],
+                self.handle_scales[self.short_path_indices[segment+1]],
+            )
         #T0, c0, c1, T1, f(c1), c2, T2, f(c2), c3, T3, ..... Tn-1, f(cn-1), cn, Tn
         #0 , 1 , 2 , 3 , 4    , 5 , 6 , 7    , 8 , 9 ,
         #T0, T1, T2,....,Tn为经过shortcut之后的路标点，c0,c1,c2,...,cn为路标点之间的控制点，f(ci)w是根据速度连续性条件得到的控制点
@@ -429,14 +547,33 @@ class PostProcess:
         self,
         ctrl_poses:Sequence[SE3],
         sample_grid:TrajectorySampleGrid|None=None,
+        *,stop_at_first:bool=False,
     )->tuple[bool,dict]:
         """以硬判定复核碰撞、落脚候选数和采样速度。"""
+        if sample_grid is None:
+            sample_grid = self._BuildTrajectorySampleGrid(ctrl_poses)
         sample_times,sample_poses = self._SampleTrajectory(ctrl_poses,sample_grid)
         invalid_sample_count = 0
         invalid_body_count = 0
         invalid_leg_count = 0
-        for pose in sample_poses:
-            _,_,body_mask,leg_mask = self.hex_state.RobotFeasiCheck(pose)
+        first_invalid_sample = None
+        for sample_index,pose in enumerate(sample_poses):
+            segment = int(sample_grid.segment_indices[sample_index])
+            parameter = float(sample_grid.u_values[sample_index])
+            indices = getattr(self,"short_path_indices",[])
+            original_interval = indices[segment:segment+2] if len(indices)==self.se3_segment_nums+1 else None
+            context = {
+                "sample_index":sample_index,"segment_index":segment,
+                "original_interval":original_interval,
+                "u":parameter,"time":float(sample_times[sample_index]),
+                "xyz":pose.t.tolist(),
+            }
+            try:
+                _,_,body_mask,leg_mask = self.hex_state.RobotFeasiCheck(pose)
+            except Exception as exc:
+                raise RuntimeError(f"Trajectory hard check raised at {context}: {exc}") from exc
+            body_mask = np.asarray(body_mask,dtype=bool)
+            leg_mask = np.asarray(leg_mask,dtype=bool)
             landing_counts = leg_mask.any(axis=-1).sum(axis=-1)
             if not body_mask.all():
                 invalid_body_count += 1
@@ -444,18 +581,30 @@ class PostProcess:
                 invalid_leg_count += 1
             if (not body_mask.all()) or ((landing_counts<3).any()):
                 invalid_sample_count += 1
+                if first_invalid_sample is None:
+                    first_invalid_sample = {
+                        **context,"body_valid":bool(body_mask.all()),
+                        "body_collision_count":int(np.count_nonzero(~body_mask)),
+                        "leg_counts":landing_counts.tolist(),
+                        "failed_legs":np.flatnonzero(landing_counts<3).tolist(),
+                    }
+                if stop_at_first:
+                    break
         dt = np.diff(sample_times)
         linear_speed = np.asarray([
             np.linalg.norm(next_pose.t-pose.t)/delta_t
             for pose,next_pose,delta_t in zip(sample_poses[:-1],sample_poses[1:],dt)
         ])
         angular_speed = np.asarray([
-            pose.angdist(next_pose)/delta_t
+            # 与 angdist 默认 metric=6 等价，跳过累积浮点误差触发的 SO(3) 检查。
+            np.linalg.norm(trlog(pose.R@next_pose.R.T,twist=True,check=False))/delta_t
             for pose,next_pose,delta_t in zip(sample_poses[:-1],sample_poses[1:],dt)
         ])
         max_linear_speed = float(np.max(linear_speed,initial=0.0))
         max_angular_speed = float(np.max(angular_speed,initial=0.0))
         speed_factor = 1.0+self.opt_cfg.speed_limit_tolerance
+        if not np.isfinite(speed_factor) or speed_factor<=0:
+            raise ValueError("speed_limit_tolerance must be finite and greater than -1")
         speed_valid = (
             max_linear_speed<=speed_factor*self.opt_cfg.v_max
             and max_angular_speed<=speed_factor*self.opt_cfg.omega_max
@@ -468,6 +617,8 @@ class PostProcess:
             "max_linear_speed":max_linear_speed,
             "max_angular_speed":max_angular_speed,
             "speed_valid":speed_valid,
+            "first_invalid_sample":first_invalid_sample,
+            "hard_check_complete":sample_index==len(sample_poses)-1,
         }
         return invalid_sample_count==0 and speed_valid,diagnostics
 
@@ -905,6 +1056,11 @@ class PostProcess:
             raise RuntimeError("No valid Bezier control poses are available to write")
         if len(self.se3_segment_times)!=self.se3_segment_nums:
             raise RuntimeError("Bezier segment times do not match the control poses")
+        # Never export a curve based solely on an optimizer's older fixed grid.
+        sample_grid = self._BuildTrajectorySampleGrid(self.se3_ctrl_poses)
+        valid,diagnostics = self._ValidateTrajectory(self.se3_ctrl_poses,sample_grid)
+        if not valid:
+            raise RuntimeError(f"Refusing to export an invalid Bezier trajectory: {diagnostics}")
 
         def PoseBlock(poses:Sequence[SE3])->dict:
             translations = []
@@ -977,22 +1133,23 @@ if __name__ == "__main__":
     hex_state = HexState(Kinematic())
     # se3_initial_file = LEGGED_GYM_ROOT_DIR+"/legged_gym/expert_complex_utils/SE3_path/teleop_demo_20260707_221719.json"
     # se3_initial_file = LEGGED_GYM_ROOT_DIR+"/legged_gym/expert_complex_utils/SE3_path/teleop_demo_20260708_220712.json"
-    se3_initial_file = LEGGED_GYM_ROOT_DIR+"/legged_gym/expert_complex_utils/SE3_path/teleop_demo_20260929_105051.json"
+    se3_initial_file = LEGGED_GYM_ROOT_DIR+"/legged_gym/expert_complex_utils/SE3_path/teleop_demo_20261105_120503.json"
     post = PostProcess(se3_initial_file,hex_state,OptCfg())
     
     post.ShortCutPath()
-    post.Optimize()
+    # post.Optimize()
     # post.Optimize_CMA_ES()
 
     # post.se3_path_short.clear()
     # for se3 in post.se3_path:
     #     post.se3_path_short.append(se3)
-    # post.GetCtrlPoes()
-    # out_dir = os.path.join(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path")
-    # json_file = os.path.join(out_dir,
-    #                              f"initial_se3_path_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+
+    post.GetCtrlPoes()
+    out_dir = os.path.join(LEGGED_GYM_ROOT_DIR,"legged_gym/expert_complex_utils/SE3_path")
+    json_file = os.path.join(out_dir,
+                                 f"initial_se3_path_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
         
-    # post.WriteJson(json_file)
+    post.WriteJson(json_file)
     # axises= np.random.random((2,3))
     # axises = axises/np.linalg.norm(axises,axis=1,keepdims=True)
     # T1 = SE3.AngleAxis(1.3,axises[0])*SE3(np.random.random((3,)))

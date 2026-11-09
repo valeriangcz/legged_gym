@@ -41,23 +41,26 @@ import numpy as np
 import pyvista as pv
 from scipy.spatial.transform import Rotation
 from spatialmath import SE3
+from spatialmath.base import trlog
 
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.expert_complex_utils import HexState, Kinematic
 
 
-GREEN = "#25a244"
-YELLOW = "#e9c46a"
-RED = "#d62828"
-BODY_GRAY = "#718096"
-PATH_BLUE = "#2166d1"
-WAYPOINT_ORANGE = "#f28e2b"
+SHOW_INDEX = True  # Show 0-based indices in path_data.waypoints.
+
+GREEN = [0.1, 0.8, 0.1]
+YELLOW = [0.9, 0.7, 0.1]
+RED = [0.9, 0.1, 0.1]
+BODY_GRAY = [0.5, 0.5, 0.5]
+PATH_BLUE = [0.1, 0.25, 0.9]
 LEG_COLORS = (
-    "#e63946", "#2a9d4b", "#277da1", "#e9c46a", "#9b5de5", "#00b4d8"
+    [0.9, 0.1, 0.1], [0.1, 0.65, 0.2], [0.1, 0.25, 0.9],
+    [0.9, 0.75, 0.05], [0.75, 0.15, 0.9], [0.0, 0.75, 0.85],
 )
 DEFAULT_MAP_STL = str(
     Path(LEGGED_GYM_ROOT_DIR)
-    / "resources/environments/sutructure1/complex_surface.STL"
+    /"resources/environments/structure2/complex_surface4.STL"
 )
 
 
@@ -129,7 +132,8 @@ class SE3PathData:
 def se3_interpolate(first: SE3, second: SE3, u: float) -> SE3:
     """Geodesic interpolation consistent with the optimizer's convention."""
     u = float(u)
-    return first * SE3.Exp(u * (first.inv() * second).log())
+    # Inputs are valid poses; skip the strict check on roundoff in products.
+    return first * SE3.Exp(u * trlog((first.inv() * second).A, check=False))
 
 
 def se3_de_casteljau(control_poses: Sequence[SE3], u: float) -> SE3:
@@ -451,6 +455,7 @@ class SE3PathVisualizer:
         self._status_actor: Any = None
         self._body_mesh: pv.PolyData | None = None
         self._body_actor: Any = None
+        self._frame_mesh: pv.PolyData | None = None
         self._leg_meshes: list[pv.PolyData] = []
         self._leg_actors: list[Any] = []
         self._landing_meshes: list[pv.PolyData] = []
@@ -462,12 +467,12 @@ class SE3PathVisualizer:
         body_voxels = robot.body_voxels
         body_surface = _surface_flat_indices(body_voxels, body_voxels.esdf_flat_for_env <= 0.0)
         body_points = np.asarray(body_voxels.center[body_surface], dtype=np.float64)
-        within_radius = np.linalg.norm(robot.leg_voxels.center, axis=1) <= 0.3
+        within_force = robot.leg_voxels.mechanical_margin >= 90.0
+        within_radius = np.linalg.norm(robot.leg_voxels.center, axis=1) >= 0.14
         legs: list[np.ndarray] = []
         for leg_index in range(6):
             reachable = robot.robot_reachable_legs[..., leg_index].any(axis=1)
-            reachable &= within_radius
-            reachable &= robot.to_bound_dist_flat[:, leg_index] >= 0.042
+            reachable &= within_force & within_radius
             surface = _surface_flat_indices(robot.leg_voxels, reachable)
             points_B = robot.leg_voxels.center[surface]
             points_R = robot.kin._B2R(points_B.T, leg_index).T
@@ -483,17 +488,25 @@ class SE3PathVisualizer:
     def build_scene(self, off_screen: bool = False) -> pv.Plotter:
         """Build all static and mutable actors without entering the GUI loop."""
         self.plotter = pv.Plotter(off_screen=off_screen, window_size=(1440, 900))
-        self.plotter.set_background("#f7fafc")
+        self.plotter.set_background("white")
         environment = pv.read(str(self.map_stl))
         self.plotter.add_mesh(
-            environment, color="#a8bed0", opacity=0.18, smooth_shading=True,
-            name="environment",
+            environment, color="lightgray", opacity=0.08, show_edges=True,
+            edge_color="silver", smooth_shading=False, name="environment",
         )
         landing = np.asarray(self.pointmap.landing_points[:: self.landing_stride])
-        self.plotter.add_mesh(
-            pv.PolyData(landing), color="#45a049", point_size=6,
-            render_points_as_spheres=True, name="static_landings",
-        )
+        raw_points = getattr(self.pointmap, "_raw_points", None)
+        nonlanding = np.asarray(self.pointmap.points[self.pointmap.landing_count:])
+        for name, points, color, point_size, opacity in (
+            ("raw_points", raw_points, "lightgray", 5.5, 0.18),
+            ("static_landings", landing, "tomato", 6.0, 1.0),
+            ("nonlanding_points", nonlanding, "black", 5.0, 1.0),
+        ):
+            if points is not None and len(points):
+                self.plotter.add_mesh(
+                    pv.PolyData(points), name=name, color=color,
+                    point_size=point_size, opacity=opacity, render_points_as_spheres=True,
+                )
         self._replace_path_actor()
         self._add_waypoints()
         self._add_robot_actors()
@@ -517,29 +530,38 @@ class SE3PathVisualizer:
         points = np.asarray([pose.t for pose in self.playback.active.poses])
         curve = pv.lines_from_points(points, close=False)
         self._path_actor = self.plotter.add_mesh(
-            curve, color=PATH_BLUE, line_width=7, render_lines_as_tubes=True,
+            curve, color=PATH_BLUE, line_width=10.0, render_lines_as_tubes=False,
             name="active_path",
         )
 
     def _add_waypoints(self) -> None:
         assert self.plotter is not None
-        positions = np.asarray([pose.t for pose in self.path_data.waypoints])
-        self.plotter.add_mesh(
-            pv.PolyData(positions), color=WAYPOINT_ORANGE, point_size=15,
-            render_points_as_spheres=True, name="waypoints",
-        )
-        self.plotter.add_point_labels(
-            positions, [f"W{i}" for i in range(len(positions))], font_size=12,
-            text_color="#b45309", point_size=0, shape=None, always_visible=True,
-            name="waypoint_labels",
-        )
-        axes = (("#d62828", 0), ("#2a9d4b", 1), ("#2166d1", 2))
         for waypoint_index, pose in enumerate(self.path_data.waypoints):
-            for color, axis in axes:
-                arrow = pv.Arrow(pose.t, pose.R[:, axis], scale=0.14)
-                self.plotter.add_mesh(
-                    arrow, color=color, name=f"waypoint_{waypoint_index}_axis_{axis}"
-                )
+            frame = self._coordinate_frame(0.2, pose)
+            self.plotter.add_mesh(
+                frame, scalars="rgb", rgb=True, name=f"waypoint_{waypoint_index}",
+            )
+        if SHOW_INDEX and self.path_data.waypoints:
+            positions = np.asarray([pose.t for pose in self.path_data.waypoints])
+            self.plotter.add_point_labels(
+                positions, [str(index) for index in range(len(positions))],
+                font_size=24, text_color="black", point_size=0,
+                shape=None, always_visible=True, name="waypoint_indices",
+            )
+
+    @staticmethod
+    def _coordinate_frame(size: float, pose: SE3) -> pv.PolyData:
+        """Build the labeler's gray origin sphere and RGB arrows at a pose."""
+        frame = pv.Sphere(radius=0.06*size)
+        frame["rgb"] = np.tile(np.asarray([0.5, 0.5, 0.5])*255, (frame.n_points, 1)).astype(np.uint8)
+        for direction, color in zip(np.eye(3), np.eye(3)):
+            arrow = pv.Arrow(
+                direction=direction, scale=size, tip_length=0.2,
+                tip_radius=0.06, shaft_radius=0.035,
+            )
+            arrow["rgb"] = np.tile(color*255, (arrow.n_points, 1)).astype(np.uint8)
+            frame = frame.merge(arrow, merge_points=False)
+        return frame.transform(pose.A, inplace=True)
 
     @staticmethod
     def _mutable_cloud(points: np.ndarray) -> pv.PolyData:
@@ -552,18 +574,22 @@ class SE3PathVisualizer:
         pose = self.playback.pose
         self._body_mesh = self._mutable_cloud(self._world_points(pose, self._body_surface_R))
         self._body_actor = self.plotter.add_mesh(
-            self._body_mesh, color=BODY_GRAY, point_size=5, render_points_as_spheres=True,
+            self._body_mesh, color=BODY_GRAY, point_size=20.0, render_points_as_spheres=True,
             name="robot_body",
         )
+        self._body_actor.SetVisibility(bool(len(self._body_surface_R)))
+        self._frame_mesh = self._coordinate_frame(0.25, pose)
+        self.plotter.add_mesh(self._frame_mesh, scalars="rgb", rgb=True, name="current_frame")
         for index, points_R in enumerate(self._leg_surfaces_R):
             mesh = self._mutable_cloud(self._world_points(pose, points_R))
             actor = self.plotter.add_mesh(
-                mesh, color=LEG_COLORS[index], opacity=0.52, point_size=4,
+                mesh, color=LEG_COLORS[index], opacity=0.4, point_size=20.0,
                 render_points_as_spheres=True, name=f"robot_leg_{index}",
             )
+            actor.SetVisibility(bool(len(points_R)))
             landing_mesh = self._mutable_cloud(np.zeros((0, 3)))
             landing_actor = self.plotter.add_mesh(
-                landing_mesh, color=LEG_COLORS[index], point_size=13,
+                landing_mesh, color=LEG_COLORS[index], point_size=5.0,
                 render_points_as_spheres=True, name=f"feasible_landing_{index}",
             )
             landing_actor.SetVisibility(False)
@@ -573,7 +599,7 @@ class SE3PathVisualizer:
             self._landing_actors.append(landing_actor)
 
     @staticmethod
-    def _set_actor_color(actor: Any, color: str) -> None:
+    def _set_actor_color(actor: Any, color: str | Sequence[float]) -> None:
         actor.prop.color = color
 
     def _query_feasibility(
@@ -596,15 +622,14 @@ class SE3PathVisualizer:
         pose = self.playback.pose
         status, landing_idx, leg_mask, error = self._query_feasibility(pose)
         self._body_mesh.points = self._world_points(pose, self._body_surface_R)
-        body_color = RED if not status.body_valid else (GREEN if status.level == "strong" else YELLOW)
+        body_color = GREEN if status.level == "strong" else (YELLOW if status.level == "weak" else RED)
         self._set_actor_color(self._body_actor, body_color)
+        if self._frame_mesh is not None:
+            self._frame_mesh.copy_from(self._coordinate_frame(0.25, pose))
         for index, (mesh, actor, points_R) in enumerate(
             zip(self._leg_meshes, self._leg_actors, self._leg_surfaces_R)
         ):
             mesh.points = self._world_points(pose, points_R)
-            count = status.leg_counts[index]
-            color = GREEN if count >= self.min_landing_per_leg else (YELLOW if count else RED)
-            self._set_actor_color(actor, color)
 
             feasible = leg_mask[index].any(axis=-1) if leg_mask.shape[1] else np.zeros(0, bool)
             points = self.pointmap.landing_points[landing_idx[feasible]] if feasible.any() else np.zeros((0, 3))
@@ -780,7 +805,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--map-stl", default=DEFAULT_MAP_STL)
     parser.add_argument("--landing-stride", type=int, default=10)
     parser.add_argument("--curve-dt", type=float, default=0.05)
-    parser.add_argument("--speed", type=float, default=1.0)
+    parser.add_argument("--speed", type=float, default=5.0)
     parser.add_argument("--min-landing-per-leg", type=int, default=3)
     return parser
 

@@ -2,9 +2,11 @@ from legged_gym.expert_complex_utils import RoboVoxels,Kinematic,HexState
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-ro = RoboVoxels(Kinematic())
-ro.PlotRobotVoxels()
-
+# ro = RoboVoxels(Kinematic())
+# ro.PlotRobotVoxels()
+hex_state = HexState(Kinematic())
+hex_state.robot_voxels.PlotRobotVoxels()
+hex_state.robot_voxels.leg_voxels.plot_leg_voxels(1)
 # hex = HexState(Kinematic())
 
 

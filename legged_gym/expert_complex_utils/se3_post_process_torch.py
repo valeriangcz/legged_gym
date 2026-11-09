@@ -8,6 +8,13 @@ Usage::
     post.ShortCutPath()
     result = post.Optimize_CMA_ES()
 
+Run the complete pipeline after configuring the input paths in ``main()``::
+
+    python3 -m legged_gym.expert_complex_utils.se3_post_process_torch
+
+The trajectory JSON and voxel caches must already exist; missing caches are
+not generated automatically.
+
 Use ``dtype=torch.float64`` when creating the scorer together with
 ``cfg.torch_precision = "float64"`` for reference scoring. The default
 ``"mixed"`` uses double SE(3)/integration and single voxel scoring. This module
@@ -29,13 +36,17 @@ from typing import Sequence
 import numpy as np
 from scipy.optimize import OptimizeResult
 from spatialmath import SE3
+from spatialmath.base import trlog
 import torch
 
 from legged_gym import LEGGED_GYM_ROOT_DIR
-from .env_robot_voxles_torch import (
+from legged_gym.expert_complex_utils.env_robot_voxles_torch import (
     HexStateTorch, PreparedCandidates, se3_exp, se3_log,
     se3_inverse, se3_geodesic, se3_bezier,
 )
+# from .env_robot_voxles_torch import (
+
+# )
 
 
 class OptCfgTorch:
@@ -108,6 +119,18 @@ class PostProcessTorch:
             raise ValueError("path JSON requires finite t:(N,3), ang:(N,), vec:(N,3)")
         self.se3_path = [SE3.Trans(t)*SE3.AngVec(float(angle), axis)
                          for t, angle, axis in zip(translations, angles, axes)]
+        if "protected_pose_indices" not in data:
+            raise ValueError("path JSON requires protected_pose_indices; use [] if no poses are protected")
+        protected = data["protected_pose_indices"]
+        if not isinstance(protected, list) or any(
+            isinstance(index, bool) or not isinstance(index, int)
+            or index < 0 or index >= len(self.se3_path) for index in protected
+        ):
+            raise ValueError(
+                "protected_pose_indices must be a list of 0-based integer indices "
+                f"in [0, {len(self.se3_path)})"
+            )
+        self.protected_pose_indices = sorted(set(protected))
 
     def _check_pose(self, pose):
         checker = getattr(self, "hard_check", None)
@@ -117,34 +140,158 @@ class PostProcessTorch:
             raise RuntimeError("hard_check must be callable")
         return checker(pose)
 
+    def _PoseFeasibilityDiagnostics(self, pose, context):
+        """Explain hard-check failures without changing their acceptance rules."""
+        try:
+            _, _, body, legs = self._check_pose(pose)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Hard check failed at {context}; xyz={pose.t.tolist()}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        body = np.asarray(body, dtype=bool)
+        counts = np.asarray(legs, dtype=bool).any(axis=-1).sum(axis=-1)
+        diagnostics = {
+            "context": context, "xyz": pose.t.tolist(),
+            "body_valid": bool(body.all()),
+            "body_collision_count": int(np.count_nonzero(~body)),
+            "leg_counts": counts.tolist(),
+            "failed_legs": np.flatnonzero(counts < 3).tolist(),
+            "min_landing_per_leg": 3,
+        }
+        return bool(body.all() and (counts >= 3).all()), diagnostics
+
     def ShortCutPath(self):
         if len(self.se3_path) < 2:
             raise ValueError("path shortening requires at least two poses")
         self._CheckSamplingConfig()
         self.se3_path_short = [self.se3_path[0]]
+        self.short_path_indices = [0]
         start = 0
         while start < len(self.se3_path)-1:
             first = self.se3_path[start]
-            for end in range(len(self.se3_path)-1, start, -1):
+            boundary = next((index for index in self.protected_pose_indices if index > start),
+                            len(self.se3_path)-1)
+            for end in range(boundary, start, -1):
+                print(
+                    f"ShortCutPath: checking poses {start}->{end} "
+                    f"(0-based indices, {len(self.se3_path)} poses)",
+                    flush=True,
+                )
                 second = self.se3_path[end]
-                # Match the front-end's SLERP + linear translation shortcut.
                 u = np.linspace(0., 1., self.opt_cfg.presample_count)
-                dense = [first.interp(second, float(value)) for value in u]
+                endpoints = self._control_tensor([first, second])
+                dense = se3_geodesic(endpoints[0], endpoints[1],
+                                     torch.as_tensor(u, device=endpoints.device, dtype=endpoints.dtype))
                 parameters = self._DistanceSampleTimes(u, dense, [0., 1.])
+                samples = self._pose_list(se3_geodesic(
+                    endpoints[0], endpoints[1],
+                    torch.as_tensor(parameters, device=endpoints.device, dtype=endpoints.dtype)))
                 feasible = True
-                for value in parameters:
-                    _, _, body, legs = self._check_pose(first.interp(second, float(value)))
-                    if not body.all() or (legs.any(axis=-1).sum(axis=-1) < 3).any():
+                for value, pose in zip(parameters, samples):
+                    valid, diagnostics = self._PoseFeasibilityDiagnostics(
+                        pose,
+                        f"shortcut {start}->{end}, u={float(value):.12g}",
+                    )
+                    if not valid:
                         feasible = False
                         break
                 if feasible:
                     self.se3_path_short.append(second)
+                    self.short_path_indices.append(end)
                     start = end
                     break
             else:
-                raise RuntimeError("adjacent transforms cannot connect to each other")
+                raise RuntimeError(
+                    f"Adjacent transforms {start}->{start+1} cannot connect; "
+                    f"next protected/end boundary={boundary}; "
+                    f"first failing sample: {diagnostics}"
+                )
+        print(f"Shorten path have key points num={len(self.short_path_indices)}; "
+              f"indices={self.short_path_indices}", flush=True)
 
     def GetCtrlPoes(self):
+        """构建连续曲线，缩柄/恢复原始路标修复空间可行性，再统一延时。"""
+        if len(self.se3_path_short)<2:
+            raise ValueError("SE3 Bezier optimization requires at least two way poses")
+        # Support callers selecting original waypoints without calling ShortCutPath.
+        indices = getattr(self,"short_path_indices",[])
+        if (len(indices)!=len(self.se3_path_short) or any(
+            not np.allclose(self.se3_path[index].A,pose.A,rtol=0,atol=1e-12)
+            for index,pose in zip(indices,self.se3_path_short)
+        )):
+            indices = []
+            start = 0
+            for pose in self.se3_path_short:
+                match = next((i for i in range(start,len(self.se3_path))
+                              if np.allclose(self.se3_path[i].A,pose.A,rtol=0,atol=1e-12)),None)
+                if match is None:
+                    raise ValueError("Shortened waypoints must map to ordered original poses for repair")
+                indices.append(match)
+                start = match+1
+        if (indices[0]!=0 or indices[-1]!=len(self.se3_path)-1
+            or any(b<=a for a,b in zip(indices[:-1],indices[1:]))
+            or not set(self.protected_pose_indices).issubset(indices)):
+            raise ValueError("Shortened path must retain endpoints and all protected poses in order")
+        self.short_path_indices = list(indices)
+        self.handle_scales = {index:1.0 for index in indices}
+        levels = (1.0,0.6,0.2,0.0)
+        self._BuildControlPoses()
+        retiming_count = 0
+        while True:
+            # Every change gets a fresh distance grid and a check from the start.
+            valid,diagnostics = self._ValidateTrajectory(
+                self.se3_ctrl_poses,stop_at_first=True
+            )
+            failure = diagnostics["first_invalid_sample"]
+            if failure is not None:
+                segment = failure["segment_index"]
+                left,right = self.short_path_indices[segment:segment+2]
+                print(f"Bezier repair: failure={failure}",flush=True)
+                if self.handle_scales[left]>0 or self.handle_scales[right]>0:
+                    for index in (left,right):
+                        level = levels.index(self.handle_scales[index])
+                        self.handle_scales[index] = levels[min(level+1,len(levels)-1)]
+                    print(f"Bezier repair: interval={left}->{right}, handle scales="
+                          f"{self.handle_scales[left]}, {self.handle_scales[right]}",flush=True)
+                elif right>left+1:
+                    middle = (left+right)//2
+                    self.short_path_indices.insert(segment+1,middle)
+                    self.se3_path_short.insert(segment+1,self.se3_path[middle])
+                    for index in (left,middle,right):
+                        self.handle_scales[index] = 1.0
+                    print(f"Bezier repair: restored original index={middle} in {left}->{right}; "
+                          f"waypoints={len(self.short_path_indices)}",flush=True)
+                else:
+                    raise RuntimeError(
+                        f"Bezier repair failed with zero handles on original adjacent poses "
+                        f"{left}->{right}: {failure}"
+                    )
+                self._BuildControlPoses()
+                retiming_count = 0
+                continue
+            if valid:
+                self.initial_repair_diagnostics = diagnostics
+                print(f"Bezier repair complete: waypoints={len(self.se3_path_short)}, "
+                      f"samples={diagnostics['sample_count']}",flush=True)
+                return
+            # Uniform timing preserves the curve and every continuity time ratio.
+            speed_factor = 1.0+self.opt_cfg.speed_limit_tolerance
+            if not np.isfinite(speed_factor) or speed_factor<=0:
+                raise ValueError("speed_limit_tolerance must be finite and greater than -1")
+            ratio = max(
+                diagnostics["max_linear_speed"]/(speed_factor*self.opt_cfg.v_max),
+                diagnostics["max_angular_speed"]/(speed_factor*self.opt_cfg.omega_max),
+            )
+            if not np.isfinite(ratio) or retiming_count>=3:
+                raise RuntimeError(f"Bezier retiming failed: {diagnostics}")
+            multiplier = max(1.0,ratio)*1.01
+            self.se3_segment_times = [duration*multiplier for duration in self.se3_segment_times]
+            retiming_count += 1
+            print(f"Bezier repair: uniformly extended segment times by {multiplier:.9g}",flush=True)
+
+    def _BuildControlPoses(self):
+        """Build baseline handles in parallel, scale once, then impose continuity."""
         if len(self.se3_path_short) < 2:
             raise ValueError("SE3 Bezier optimization requires at least two way poses")
         if self.opt_cfg.v_max <= 0 or self.opt_cfg.omega_max <= 0:
@@ -154,9 +301,14 @@ class PostProcessTorch:
         first, last = waypoints[:-1], waypoints[1:]
         controls = torch.stack((first, se3_geodesic(first, last, 1/3),
                                 se3_geodesic(first, last, 2/3), last), 1)
+        scales = torch.tensor([self.handle_scales[i] for i in self.short_path_indices],
+                              device=waypoints.device, dtype=waypoints.dtype)
+        controls[0, 1] = se3_geodesic(first[0], controls[0, 1], scales[0])
+        controls[:, 2] = se3_geodesic(last, controls[:, 2], scales[1:])
         self.se3_ctrl_poses = self._pose_list(controls.reshape(-1, 4, 4))
         self.se3_segment_times = [max(np.linalg.norm(b.t-a.t)/(self.opt_cfg.v_max*0.3),
-                                      a.angdist(b)/(self.opt_cfg.omega_max*0.3), 1e-6)
+                                      np.linalg.norm(trlog(a.R@b.R.T, twist=True, check=False))
+                                      /(self.opt_cfg.omega_max*0.3), 1e-6)
                                   for a, b in zip(self.se3_path_short[:-1], self.se3_path_short[1:])]
         self.opt_poses_index = [1, 2]
         self.vec_continuous_poses_index = []
@@ -286,22 +438,46 @@ class PostProcessTorch:
                               torch.linalg.vector_norm(delta[:, 3:], dim=-1).max())).cpu().numpy()
         return {"sample_count": len(poses), "max_rho_step": float(maxima[0]), "max_phi_step": float(maxima[1])}
 
-    def _ValidateTrajectory(self, controls, sample_grid=None):
+    def _ValidateTrajectory(self, controls, sample_grid=None, *, stop_at_first=False):
+        if sample_grid is None:
+            sample_grid = self._BuildTrajectorySampleGrid(controls)
         times, poses = self._SampleTrajectory(controls, sample_grid)
         invalid_body = invalid_legs = invalid_samples = 0
-        for pose in poses:
-            _, _, body, legs = self._check_pose(pose)
-            body_failed = not body.all()
-            legs_failed = (legs.any(axis=-1).sum(axis=-1) < 3).any()
+        first_invalid_sample = None
+        for index, pose in enumerate(poses):
+            segment = int(sample_grid.segment_indices[index])
+            indices = getattr(self, "short_path_indices", [])
+            interval = indices[segment:segment+2] if len(indices)==self.se3_segment_nums+1 else None
+            valid, detail = self._PoseFeasibilityDiagnostics(
+                pose, f"trajectory sample {index}, segment={segment}, original_interval={interval}, "
+                f"u={float(sample_grid.u_values[index]):.12g}, t={float(times[index]):.12g}s"
+            )
+            detail.update(
+                sample_index=index, segment_index=segment,
+                original_interval=interval,
+                u=float(sample_grid.u_values[index]), time=float(times[index]),
+            )
+            body_failed = not detail["body_valid"]
+            legs_failed = bool(detail["failed_legs"])
+            if not valid and first_invalid_sample is None:
+                first_invalid_sample = detail
             invalid_body += int(body_failed)
             invalid_legs += int(legs_failed)
             invalid_samples += int(body_failed or legs_failed)
+            if not valid and stop_at_first:
+                break
         linear_speed = max(np.linalg.norm(b.t-a.t)/dt for a, b, dt in zip(poses[:-1], poses[1:], np.diff(times)))
-        angular_speed = max(a.angdist(b)/dt for a, b, dt in zip(poses[:-1], poses[1:], np.diff(times)))
+        # Equivalent to angdist(metric=6), without strict SO(3) checks on rounded poses.
+        angular_speed = max(np.linalg.norm(trlog(a.R@b.R.T, twist=True, check=False))/dt
+                            for a, b, dt in zip(poses[:-1], poses[1:], np.diff(times)))
         factor = 1+self.opt_cfg.speed_limit_tolerance
+        if not np.isfinite(factor) or factor<=0:
+            raise ValueError("speed_limit_tolerance must be finite and greater than -1")
         speed_valid = linear_speed <= factor*self.opt_cfg.v_max and angular_speed <= factor*self.opt_cfg.omega_max
         diagnostics = {"invalid_sample_count": invalid_samples, "invalid_body_count": invalid_body,
                        "invalid_leg_count": invalid_legs, **self._SamplingDiagnostics(poses),
+                       "first_invalid_sample": first_invalid_sample,
+                       "hard_check_complete": index==len(poses)-1,
                        "max_linear_speed": float(linear_speed), "max_angular_speed": float(angular_speed),
                        "speed_valid": bool(speed_valid)}
         return invalid_samples == 0 and bool(speed_valid), diagnostics
@@ -344,6 +520,11 @@ class PostProcessTorch:
             raise RuntimeError("No valid Bezier control poses are available to write")
         if len(self.se3_segment_times)!=self.se3_segment_nums:
             raise RuntimeError("Bezier segment times do not match the control poses")
+        # Validate and export the actual final curve on a newly generated grid.
+        sample_grid = self._BuildTrajectorySampleGrid(self.se3_ctrl_poses)
+        valid, diagnostics = self._ValidateTrajectory(self.se3_ctrl_poses, sample_grid)
+        if not valid:
+            raise RuntimeError(f"Refusing to export an invalid Bezier trajectory: {diagnostics}")
 
         def PoseBlock(poses:Sequence[SE3])->dict:
             translations = []
@@ -667,3 +848,30 @@ class PostProcessTorch:
                               validation=diagnostics, feasibility_cost=float(feasibility),
                               acceleration_cost=float(acceleration), output_path=output_path,
                               torch_device=str(scorer.device), torch_precision=cfg.torch_precision)
+
+
+def main() -> OptimizeResult:
+    """Shorten and optimize the configured path using existing voxel caches."""
+    root = Path(LEGGED_GYM_ROOT_DIR)
+    se3_initial_file = root/"legged_gym/expert_complex_utils/SE3_path/teleop_demo_20261105_120503.json"
+    point_map_file = root/"resources/environments/structure2/complex_surface4_point_map.npz"
+    voxel_dir = root/"legged_gym/expert_complex_utils/voxels_info"
+    device = "auto"
+    cfg = OptCfgTorch()
+
+    dtype = torch.float64 if cfg.torch_precision == "float64" else torch.float32
+    scorer = HexStateTorch.from_files(
+        point_map_file, voxel_dir, device=device, dtype=dtype,
+        pose_chunk_size=cfg.torch_pose_chunk_size,
+    )
+    post = PostProcessTorch(se3_initial_file, scorer, cfg)
+    post.ShortCutPath()
+    result = post.Optimize_CMA_ES()
+    print(f"Torch CMA-ES finished: cost={result.fun}, success={result.success}, "
+          f"status={result.status}, message={result.message}", flush=True)
+    print(f"Optimized SE3 path: {result.output_path}", flush=True)
+    return result
+
+
+if __name__ == "__main__":
+    main()

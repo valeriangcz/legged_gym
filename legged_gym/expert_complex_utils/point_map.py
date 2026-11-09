@@ -45,9 +45,9 @@ class PointMap:
         voxel_size: float = 0.02, #降采样后的点的平均间隔
         suction_diameter: float = 0.04, #吸盘直径
         normal_radius: float = 0.04, #
-        plane_error_threshold: float = 0.03,
+        plane_error_threshold: float = 100000.0, #设置一个较大的值，先不考虑平面误差
         edge_buffer_distance: Optional[float] = None,
-        edge_normal_angle_threshold: float = np.deg2rad(35.0),
+        edge_normal_angle_threshold: float = np.deg2rad(45.0),
         boundary_angle_gap_threshold: float = np.deg2rad(120.0),
         source_scale: Optional[float] = None,
         surface_sample_spacing: float = 0.01, #对STL文件表面的采样间距，建议取比voxel_size更细一些
@@ -959,8 +959,8 @@ if __name__=='__main__':
         # "/home/sharpa/valerian_ws/legged_gym/resources/environments/sutructure1/complex_surface.STL",
         # "/home/sharpa/valerian_ws/legged_gym/resources/environments/sutructure1/complex_surface_point_map.npz",
         # LEGGED_GYM_ROOT_DIR+"/resources/environments/sutructure1/complex_surface.STL",
-        # LEGGED_GYM_ROOT_DIR+"/resources/environments/structure2/complex_surface4.STL",
-        LEGGED_GYM_ROOT_DIR+"/resources/environments/structure2/complex_surface4_point_map.npz",
+        LEGGED_GYM_ROOT_DIR+"/resources/environments/structure2/complex_surface4.STL",
+        # LEGGED_GYM_ROOT_DIR+"/resources/environments/structure2/complex_surface4_point_map.npz",
         # "/home/val/BIH_ws/legged_gym/resources/environments/sutructure1/complex_surface_point_map.npz",
         verbose=True,
     )
